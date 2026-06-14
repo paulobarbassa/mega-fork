@@ -1,0 +1,1121 @@
+<script>
+/* ==========================================================================
+   MEGA - RELATÓRIO DE CAMPOS DE RESOLUÇÃO
+   Gera um relatório por agente dos campos personalizados preenchidos ao
+   encerrar conversas (ex.: tipo de atendimento, motivo de contato). Os dados
+   são obtidos via API nativa do Mega no contexto do usuário autenticado.
+   O relatório pode ser exportado como CSV.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: ajuste FIELD_CONFIG com as chaves dos atributos de resolução
+   da sua instalação. Ajuste MAX_PAGES e MAX_DETAIL_CONVERSATIONS conforme
+   o volume de conversas do seu ambiente.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var STYLE_ID = 'enge-resolution-fields-report-style';
+  var BUTTON_ID = 'enge-resolution-fields-report-btn';
+  var OVERLAY_ID = 'enge-resolution-fields-report-overlay';
+  var CACHE_PREFIX = 'erfr_';
+  var CACHE_TTL_MS = 3 * 60 * 1000;
+  var MAX_PAGES = 25;
+  var MAX_DETAIL_CONVERSATIONS = 600;
+  var DETAIL_CONCURRENCY = 6;
+  var DIAGNOSTIC_SAMPLE_SIZE = 40;
+
+  var FIELD_CONFIG = [
+    {
+      key: 'attendance_type',
+      label: 'Tipo de Atendimento',
+      aliases: [
+        'tipo_de_atendimento',
+        'tipo_atendimento',
+        'atendimento_tipo',
+        'tipo_de_atendimento_resolucao',
+        'resolution_attendance_type',
+        'attendance_type',
+        'service_type',
+        'Tipo de Atendimento'
+      ]
+    },
+    {
+      key: 'original_report',
+      label: 'O que o cliente relatou originalmente?',
+      aliases: [
+        'o_que_o_cliente_relatou_originalmente',
+        'cliente_relatou_originalmente',
+        'relato_original_cliente',
+        'relato_original',
+        'problema_informado_cliente',
+        'original_customer_report',
+        'original_report',
+        'O que o cliente relatou originalmente?'
+      ]
+    },
+    {
+      key: 'real_problem',
+      label: 'Qual o problema real encontrado?',
+      aliases: [
+        'qual_o_problema_real_encontrado',
+        'problema_real_encontrado',
+        'problema_real',
+        'causa_raiz',
+        'root_cause',
+        'real_problem',
+        'Qual o problema real encontrado?'
+      ]
+    },
+    {
+      key: 'applied_solution',
+      label: 'Qual solução foi aplicada?',
+      aliases: [
+        'qual_solucao_foi_aplicada',
+        'qual_a_solucao_foi_aplicada',
+        'solucao_aplicada',
+        'solucao',
+        'applied_solution',
+        'solution_applied',
+        'Qual solução foi aplicada?',
+        'Qual solucao foi aplicada?'
+      ]
+    }
+  ];
+
+  if (document.getElementById(STYLE_ID)) return;
+
+  var currentReport = null;
+  var currentDays = 30;
+  var currentInboxId = null;
+  var lastUrl = location.href;
+
+  var style = document.createElement('style');
+  style.id = STYLE_ID;
+  style.textContent = [
+    '#' + OVERLAY_ID + ' {',
+    '  position: fixed; inset: 0; z-index: 99999; overflow: auto;',
+    '  background: var(--b-50, #f8fafc); color: var(--s-900, #111827);',
+    '  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;',
+    '  font-size: 14px; line-height: 1.5;',
+    '}',
+    '.dark #' + OVERLAY_ID + ' { background: var(--b-900, #0f172a); color: var(--s-100, #f8fafc); }',
+    '.erfr-header {',
+    '  position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between;',
+    '  gap: 12px; padding: 14px 22px; background: var(--w-500, #1f93ff); color: #fff;',
+    '  box-shadow: 0 1px 2px rgba(15,23,42,.18);',
+    '}',
+    '.erfr-title { display:flex; align-items:center; gap:10px; min-width: 0; }',
+    '.erfr-title h1 { margin: 0; font-size: 18px; font-weight: 650; white-space: nowrap; }',
+    '.erfr-title span { opacity: .85; font-size: 12px; white-space: nowrap; }',
+    '.erfr-header-right { display:flex; align-items:center; gap:8px; flex-wrap: wrap; justify-content: flex-end; }',
+    '.erfr-period-btn, .erfr-action-btn, .erfr-close-btn {',
+    '  border: 1px solid rgba(255,255,255,.32); border-radius: 6px; background: rgba(255,255,255,.10);',
+    '  color: #fff; cursor: pointer; font-size: 13px; transition: background .15s, border-color .15s;',
+    '}',
+    '.erfr-period-btn { padding: 4px 10px; }',
+    '.erfr-action-btn { padding: 5px 11px; font-weight: 600; }',
+    '.erfr-close-btn { width: 32px; height: 32px; display:flex; align-items:center; justify-content:center; font-size:18px; }',
+    '.erfr-period-btn:hover, .erfr-action-btn:hover, .erfr-close-btn:hover { background: rgba(255,255,255,.22); }',
+    '.erfr-period-btn.active { background: rgba(255,255,255,.28); font-weight: 700; }',
+    '.erfr-action-btn:disabled { opacity:.55; cursor:not-allowed; }',
+    '.erfr-inbox-select {',
+    '  padding: 4px 28px 4px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,.32);',
+    '  background: rgba(255,255,255,.12); color: #fff; font-size: 13px; cursor: pointer;',
+    '  max-width: 210px; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2712%27 height=%2712%27 fill=%27white%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M4.646 5.646a.5.5 0 0 1 .708 0L8 8.293l2.646-2.647a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-3-3a.5.5 0 0 1 0-.708z%27/%3E%3C/svg%3E");',
+    '  background-repeat: no-repeat; background-position: right 8px center;',
+    '}',
+    '.erfr-inbox-select option { color:#111827; background:#fff; }',
+    '.erfr-content { max-width: 1440px; margin: 0 auto; padding: 22px; }',
+    '.erfr-kpi-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:14px; margin-bottom:20px; }',
+    '.erfr-kpi, .erfr-card { background: var(--white, #fff); border-radius: 8px; box-shadow: 0 1px 3px rgba(15,23,42,.08); }',
+    '.dark .erfr-kpi, .dark .erfr-card { background: var(--b-800, #1e293b); }',
+    '.erfr-kpi { padding: 18px; }',
+    '.erfr-kpi-value { color: var(--w-500, #1f93ff); font-size: 26px; font-weight: 750; line-height:1.1; }',
+    '.erfr-kpi-label { margin-top: 5px; color: var(--s-500, #64748b); font-size: 11px; text-transform: uppercase; letter-spacing: .4px; font-weight: 700; }',
+    '.dark .erfr-kpi-label { color: var(--s-300, #cbd5e1); }',
+    '.erfr-section-title { margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 2px solid var(--w-500, #1f93ff); font-size: 16px; font-weight: 700; }',
+    '.erfr-card { padding: 18px; margin-bottom: 16px; }',
+    '.erfr-card h2, .erfr-card h3 { margin: 0 0 12px; font-size: 15px; font-weight: 700; }',
+    '.erfr-table-wrap { overflow:auto; border-radius: 8px; border: 1px solid var(--s-100, #e2e8f0); }',
+    '.dark .erfr-table-wrap { border-color: var(--s-700, #334155); }',
+    '.erfr-table { width:100%; border-collapse:collapse; min-width: 860px; font-size: 13px; }',
+    '.erfr-table th {',
+    '  text-align:left; padding: 9px 11px; font-size: 11px; text-transform: uppercase; letter-spacing: .35px;',
+    '  color: var(--s-500, #64748b); border-bottom: 2px solid var(--s-200, #e2e8f0); background: var(--s-50, #f8fafc);',
+    '}',
+    '.dark .erfr-table th { color: var(--s-300, #cbd5e1); border-bottom-color: var(--s-700, #334155); background: var(--b-700, #334155); }',
+    '.erfr-table td { padding: 9px 11px; border-bottom: 1px solid var(--s-100, #edf2f7); vertical-align: top; }',
+    '.dark .erfr-table td { border-bottom-color: var(--s-800, #1e293b); }',
+    '.erfr-table tr:hover td { background: var(--s-50, #f8fafc); }',
+    '.dark .erfr-table tr:hover td { background: var(--b-700, #334155); }',
+    '.erfr-link { color: var(--w-500, #1f93ff); font-weight: 700; text-decoration:none; }',
+    '.erfr-link:hover { text-decoration: underline; }',
+    '.erfr-muted { color: var(--s-500, #64748b); }',
+    '.dark .erfr-muted { color: var(--s-300, #cbd5e1); }',
+    '.erfr-badge { display:inline-flex; align-items:center; justify-content:center; border-radius: 999px; padding: 2px 8px; font-size: 11px; font-weight: 700; white-space: nowrap; }',
+    '.erfr-badge-ok { background:#dcfce7; color:#166534; }',
+    '.erfr-badge-warn { background:#fef3c7; color:#92400e; }',
+    '.erfr-badge-bad { background:#fee2e2; color:#991b1b; }',
+    '.dark .erfr-badge-ok { background:#14532d; color:#bbf7d0; }',
+    '.dark .erfr-badge-warn { background:#78350f; color:#fde68a; }',
+    '.dark .erfr-badge-bad { background:#7f1d1d; color:#fecaca; }',
+    '.erfr-missing-list { display:flex; flex-wrap:wrap; gap:4px; }',
+    '.erfr-field-preview { max-width: 280px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+    '.erfr-loading, .erfr-empty, .erfr-error { display:flex; align-items:center; justify-content:center; min-height: 180px; text-align:center; color: var(--s-500, #64748b); }',
+    '.erfr-error { color: var(--r-500, #ef4444); flex-direction: column; gap: 8px; }',
+    '.erfr-spinner { width:30px; height:30px; border:3px solid var(--s-200, #e5e7eb); border-top-color: var(--w-500, #1f93ff); border-radius:50%; animation: erfr-spin .8s linear infinite; margin-right:10px; }',
+    '@keyframes erfr-spin { to { transform: rotate(360deg); } }',
+    '.erfr-warning {',
+    '  padding: 11px 13px; border-radius: 8px; margin-bottom: 12px; background:#fffbeb; color:#92400e; border:1px solid #fde68a;',
+    '}',
+    '.dark .erfr-warning { background:#422006; color:#fde68a; border-color:#78350f; }',
+    '.erfr-diagnostics { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }',
+    '.erfr-diagnostic-box { border: 1px solid var(--s-100, #e2e8f0); border-radius: 8px; padding: 10px; min-width: 0; }',
+    '.dark .erfr-diagnostic-box { border-color: var(--s-700, #334155); }',
+    '.erfr-diagnostic-box h4 { margin:0 0 6px; font-size:12px; }',
+    '.erfr-code-list { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-word; color: var(--s-700, #334155); }',
+    '.dark .erfr-code-list { color: var(--s-200, #e2e8f0); }',
+    '#' + BUTTON_ID + ' {',
+    '  display:flex; align-items:center; justify-content:center; width:40px; height:40px; border-radius:10px;',
+    '  background:transparent; border:none; cursor:pointer; color: var(--s-500, #6b7280); transition: all .2s; position:relative;',
+    '}',
+    '#' + BUTTON_ID + ':hover { background: var(--s-100, #f1f5f9); color: var(--w-500, #1f93ff); }',
+    '.dark #' + BUTTON_ID + ':hover { background: var(--b-800, #1e293b); }',
+    '#' + BUTTON_ID + ' svg { width:22px; height:22px; }',
+    '@media (max-width: 800px) {',
+    '  .erfr-header { align-items:flex-start; flex-direction:column; }',
+    '  .erfr-header-right { justify-content:flex-start; }',
+    '  .erfr-title { flex-direction:column; align-items:flex-start; gap:2px; }',
+    '  .erfr-content { padding: 14px; }',
+    '}'
+  ].join('\n');
+  document.head.appendChild(style);
+
+  function getActiveAccountId() {
+    var m = location.pathname.match(/\/app\/accounts\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  function getStore() {
+    try {
+      var app = document.getElementById('app');
+      if (app && app.__vue_app__) return app.__vue_app__.config.globalProperties.$store;
+    } catch (_) {}
+    return null;
+  }
+
+  function getToken() {
+    if (typeof window.authToken === 'string' && window.authToken) return window.authToken;
+    try {
+      var store = getStore();
+      if (!store) return null;
+      var user = store.getters['auth/getCurrentUser'] || store.getters.getCurrentUser;
+      return (user && user.access_token) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function esc(value) {
+    var div = document.createElement('div');
+    div.textContent = value == null ? '' : String(value);
+    return div.innerHTML;
+  }
+
+  function escAttr(value) {
+    return esc(value).replace(/"/g, '&quot;');
+  }
+
+  function normalizeKey(value) {
+    return String(value || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+  }
+
+  function normalizeValue(value) {
+    if (value == null) return '';
+    if (Array.isArray(value)) {
+      return value.map(normalizeValue).filter(Boolean).join(', ');
+    }
+    if (typeof value === 'object') {
+      if (value.label != null) return normalizeValue(value.label);
+      if (value.name != null) return normalizeValue(value.name);
+      if (value.value != null) return normalizeValue(value.value);
+      try {
+        return JSON.stringify(value);
+      } catch (_) {
+        return '';
+      }
+    }
+    return String(value).trim();
+  }
+
+  function isMissingValue(value) {
+    var normalized = normalizeValue(value).toLowerCase();
+    return !normalized || normalized === '-' || normalized === '--' || normalized === '---' ||
+      normalized === 'null' || normalized === 'undefined' || normalized === 'selecione o valor';
+  }
+
+  function toTimestamp(value) {
+    if (value == null || value === '') return null;
+    if (typeof value === 'number') {
+      return value > 100000000000 ? Math.floor(value / 1000) : Math.floor(value);
+    }
+    var parsed = Date.parse(value);
+    return isNaN(parsed) ? null : Math.floor(parsed / 1000);
+  }
+
+  function formatDateTime(timestamp) {
+    if (timestamp == null) return '—';
+    try {
+      return new Date(timestamp * 1000).toLocaleString('pt-BR', {
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit'
+      });
+    } catch (_) {
+      return '—';
+    }
+  }
+
+  function formatPercent(value) {
+    if (value == null || isNaN(value)) return '—';
+    return value.toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + '%';
+  }
+
+  function dateRange(days) {
+    var now = new Date();
+    if (days === 0) {
+      var todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return { since: Math.floor(todayStart.getTime() / 1000), until: Math.floor(now.getTime() / 1000) };
+    }
+    if (days === 1) {
+      var yStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+      var yEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return { since: Math.floor(yStart.getTime() / 1000), until: Math.floor(yEnd.getTime() / 1000) };
+    }
+    return {
+      since: Math.floor((now.getTime() - days * 86400000) / 1000),
+      until: Math.floor(now.getTime() / 1000)
+    };
+  }
+
+  function periodLabel(days) {
+    if (days === 0) return 'Hoje';
+    if (days === 1) return 'Ontem';
+    return 'Últimos ' + days + ' dias';
+  }
+
+  function isInRange(timestamp, range) {
+    return timestamp != null && timestamp >= range.since && timestamp <= range.until;
+  }
+
+  function cacheGet(key) {
+    try {
+      var raw = sessionStorage.getItem(CACHE_PREFIX + key);
+      if (!raw) return null;
+      var obj = JSON.parse(raw);
+      if (!obj || Date.now() - obj.ts > CACHE_TTL_MS) {
+        sessionStorage.removeItem(CACHE_PREFIX + key);
+        return null;
+      }
+      return obj.data;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function cacheSet(key, data) {
+    try {
+      sessionStorage.setItem(CACHE_PREFIX + key, JSON.stringify({ ts: Date.now(), data: data }));
+    } catch (_) {}
+  }
+
+  function fetchPlatformApi(path, apiVersion) {
+    var accountId = getActiveAccountId();
+    var token = getToken();
+    if (!accountId) return Promise.reject(new Error('Conta não encontrada na URL'));
+    if (!token) return Promise.reject(new Error('Token de acesso não encontrado'));
+    var version = apiVersion || 'v1';
+    return fetch('/api/' + version + '/accounts/' + accountId + path, {
+      headers: { api_access_token: token }
+    }).then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    });
+  }
+
+  function responsePayload(response) {
+    if (Array.isArray(response)) return response;
+    if (!response) return [];
+    if (response.data && Array.isArray(response.data.payload)) return response.data.payload;
+    if (Array.isArray(response.payload)) return response.payload;
+    if (Array.isArray(response.data)) return response.data;
+    return [];
+  }
+
+  function extractConversationDetail(response) {
+    if (!response) return null;
+    if (response.data && !Array.isArray(response.data) && typeof response.data === 'object') return response.data;
+    if (response.payload && !Array.isArray(response.payload) && typeof response.payload === 'object') return response.payload;
+    if (typeof response === 'object' && !Array.isArray(response)) return response;
+    return null;
+  }
+
+  function getConversationId(conversation) {
+    return String(conversation && (conversation.id || conversation.display_id || ''));
+  }
+
+  function getConversationAssignee(conversation) {
+    var meta = (conversation && conversation.meta) || {};
+    var assignee = meta.assignee || conversation.assignee || {};
+    var id = assignee.id || conversation.assignee_id || null;
+    var name = assignee.name || assignee.available_name || null;
+    if (!name && id != null) name = 'Agente #' + id;
+    return {
+      id: id,
+      name: name || 'Sem agente'
+    };
+  }
+
+  function getContactName(conversation) {
+    var meta = (conversation && conversation.meta) || {};
+    var sender = meta.sender || conversation.sender || conversation.contact || {};
+    return sender.name || sender.available_name || sender.phone_number || 'Sem nome';
+  }
+
+  function getConversationResolvedInfo(conversation) {
+    if (!conversation || conversation.status !== 'resolved') return { timestamp: null, source: '', precise: false };
+    var sources = [
+      { name: 'conversation', value: conversation },
+      { name: 'conversation.meta', value: conversation.meta },
+      { name: 'conversation.additional_attributes', value: conversation.additional_attributes },
+      { name: 'conversation.custom_attributes', value: conversation.custom_attributes }
+    ];
+    var preciseKeys = [
+      'resolved_at',
+      'resolvedAt',
+      'resolved_at_ts',
+      'resolvedAtTs',
+      'resolved_at_timestamp',
+      'resolvedAtTimestamp',
+      'resolution_at',
+      'resolutionAt',
+      'closed_at',
+      'closedAt',
+      'status_changed_at',
+      'statusChangedAt',
+      'status_updated_at',
+      'statusUpdatedAt'
+    ];
+
+    for (var sourceIndex = 0; sourceIndex < sources.length; sourceIndex++) {
+      var source = sources[sourceIndex];
+      if (!source.value) continue;
+      for (var keyIndex = 0; keyIndex < preciseKeys.length; keyIndex++) {
+        var key = preciseKeys[keyIndex];
+        var timestamp = toTimestamp(source.value[key]);
+        if (timestamp != null) return { timestamp: timestamp, source: source.name + '.' + key, precise: true };
+      }
+    }
+
+    var fallbackKeys = ['last_activity_at', 'updated_at', 'created_at', 'timestamp'];
+    for (var i = 0; i < fallbackKeys.length; i++) {
+      var fallbackTimestamp = toTimestamp(conversation[fallbackKeys[i]]);
+      if (fallbackTimestamp != null) {
+        return { timestamp: fallbackTimestamp, source: 'conversation.' + fallbackKeys[i], precise: false };
+      }
+    }
+    return { timestamp: null, source: '', precise: false };
+  }
+
+  function mergeConversationDetail(original, detail) {
+    if (!detail) return original;
+    var merged = Object.assign({}, original, detail);
+    merged.meta = Object.assign({}, original.meta || {}, detail.meta || {});
+    merged.custom_attributes = Object.assign({}, original.custom_attributes || {}, detail.custom_attributes || {});
+    merged.additional_attributes = Object.assign({}, original.additional_attributes || {}, detail.additional_attributes || {});
+    return merged;
+  }
+
+  function fetchInboxes() {
+    return fetchPlatformApi('/inboxes', 'v1').catch(function () {
+      return fetchPlatformApi('/inboxes', 'v2');
+    }).then(function (response) {
+      return responsePayload(response);
+    }).catch(function () {
+      return [];
+    });
+  }
+
+  function fetchResolvedConversations(days, inboxId) {
+    var range = dateRange(days);
+    var inboxQuery = inboxId ? '&inbox_id=' + encodeURIComponent(inboxId) : '';
+    var all = [];
+    var pageCount = 0;
+    var limited = false;
+    var usedFallbackDate = false;
+
+    function fetchPage(page) {
+      pageCount = Math.max(pageCount, page);
+      return fetchPlatformApi('/conversations?status=resolved&page=' + page + inboxQuery, 'v1').then(function (response) {
+        var payload = responsePayload(response);
+        for (var i = 0; i < payload.length; i++) {
+          var conversation = payload[i];
+          var resolvedInfo = getConversationResolvedInfo(conversation);
+          if (!resolvedInfo.precise && resolvedInfo.timestamp != null) usedFallbackDate = true;
+          if (isInRange(resolvedInfo.timestamp, range)) {
+            all.push(conversation);
+          }
+        }
+        if (!payload.length || payload.length < 25) return;
+        if (page >= MAX_PAGES) {
+          limited = true;
+          return;
+        }
+        return fetchPage(page + 1);
+      });
+    }
+
+    return fetchPage(1).then(function () {
+      return {
+        conversations: all,
+        range: range,
+        pageCount: pageCount,
+        limited: limited,
+        usedFallbackDate: usedFallbackDate
+      };
+    });
+  }
+
+  function fetchConversationDetails(conversations) {
+    var slice = conversations.slice(0, MAX_DETAIL_CONVERSATIONS);
+    var limited = conversations.length > slice.length;
+    var nextIndex = 0;
+    var failed = 0;
+    var details = new Array(slice.length);
+
+    function fetchNext() {
+      if (nextIndex >= slice.length) return Promise.resolve();
+      var index = nextIndex++;
+      var original = slice[index];
+      var id = getConversationId(original);
+      return fetchPlatformApi('/conversations/' + encodeURIComponent(id), 'v1')
+        .then(function (response) {
+          details[index] = mergeConversationDetail(original, extractConversationDetail(response));
+        })
+        .catch(function () {
+          failed++;
+          details[index] = Object.assign({}, original, { _detail_error: true });
+        })
+        .then(fetchNext);
+    }
+
+    var workers = [];
+    var workerCount = Math.min(DETAIL_CONCURRENCY, slice.length);
+    for (var i = 0; i < workerCount; i++) workers.push(fetchNext());
+    return Promise.all(workers).then(function () {
+      return { conversations: details.filter(Boolean), limited: limited, failed: failed };
+    });
+  }
+
+  function findValueByAliases(source, aliases) {
+    if (!source || typeof source !== 'object') return null;
+    for (var i = 0; i < aliases.length; i++) {
+      var exactKey = aliases[i];
+      if (Object.prototype.hasOwnProperty.call(source, exactKey)) {
+        return { key: exactKey, value: source[exactKey] };
+      }
+    }
+
+    var normalizedAliases = {};
+    for (var aliasIndex = 0; aliasIndex < aliases.length; aliasIndex++) {
+      normalizedAliases[normalizeKey(aliases[aliasIndex])] = true;
+    }
+    var keys = Object.keys(source);
+    for (var keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+      var key = keys[keyIndex];
+      if (normalizedAliases[normalizeKey(key)]) {
+        return { key: key, value: source[key] };
+      }
+    }
+    return null;
+  }
+
+  function readConversationField(conversation, field) {
+    var meta = (conversation && conversation.meta) || {};
+    var sources = [
+      { name: 'conversation.custom_attributes', value: conversation && conversation.custom_attributes },
+      { name: 'conversation.additional_attributes', value: conversation && conversation.additional_attributes },
+      { name: 'conversation.meta.custom_attributes', value: meta.custom_attributes },
+      { name: 'conversation.meta', value: meta },
+      { name: 'conversation', value: conversation }
+    ];
+    for (var i = 0; i < sources.length; i++) {
+      var found = findValueByAliases(sources[i].value, field.aliases);
+      if (found) {
+        var normalized = normalizeValue(found.value);
+        return {
+          value: normalized,
+          matchedKey: found.key,
+          source: sources[i].name,
+          filled: !isMissingValue(normalized)
+        };
+      }
+    }
+    return { value: '', matchedKey: '', source: '', filled: false };
+  }
+
+  function createEmptyFieldStats() {
+    var stats = {};
+    for (var i = 0; i < FIELD_CONFIG.length; i++) {
+      stats[FIELD_CONFIG[i].key] = {
+        label: FIELD_CONFIG[i].label,
+        filled: 0,
+        missing: 0,
+        matches: {}
+      };
+    }
+    return stats;
+  }
+
+  function recordFieldStat(stats, field, result) {
+    var entry = stats[field.key];
+    if (!entry) return;
+    if (result.filled) entry.filled++;
+    else entry.missing++;
+    if (result.matchedKey) {
+      var matchKey = result.source + '.' + result.matchedKey;
+      entry.matches[matchKey] = (entry.matches[matchKey] || 0) + 1;
+    }
+  }
+
+  function buildRows(conversations) {
+    var stats = createEmptyFieldStats();
+    var rows = [];
+    for (var i = 0; i < conversations.length; i++) {
+      var conversation = conversations[i];
+      var assignee = getConversationAssignee(conversation);
+      var resolvedInfo = getConversationResolvedInfo(conversation);
+      var fields = {};
+      var missingLabels = [];
+      var fieldCount = 0;
+
+      for (var fieldIndex = 0; fieldIndex < FIELD_CONFIG.length; fieldIndex++) {
+        var field = FIELD_CONFIG[fieldIndex];
+        var result = readConversationField(conversation, field);
+        recordFieldStat(stats, field, result);
+        fields[field.key] = {
+          label: field.label,
+          value: result.value,
+          filled: result.filled,
+          matchedKey: result.matchedKey,
+          source: result.source
+        };
+        if (result.filled) fieldCount++;
+        else missingLabels.push(field.label);
+      }
+
+      rows.push({
+        id: getConversationId(conversation),
+        contact: getContactName(conversation),
+        agentId: assignee.id,
+        agentName: assignee.name,
+        resolvedAt: resolvedInfo.timestamp,
+        resolvedSource: resolvedInfo.source,
+        preciseResolutionDate: resolvedInfo.precise,
+        fields: fields,
+        fieldCount: fieldCount,
+        complete: missingLabels.length === 0,
+        missingLabels: missingLabels,
+        detailFailed: Boolean(conversation._detail_error)
+      });
+    }
+    rows.sort(function (a, b) {
+      var byAgent = String(a.agentName).localeCompare(String(b.agentName), 'pt-BR');
+      if (byAgent !== 0) return byAgent;
+      return (b.resolvedAt || 0) - (a.resolvedAt || 0);
+    });
+    return { rows: rows, fieldStats: stats };
+  }
+
+  function aggregateAgents(rows) {
+    var map = {};
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var key = row.agentId != null ? 'id:' + row.agentId : 'name:' + row.agentName;
+      if (!map[key]) {
+        map[key] = {
+          id: row.agentId,
+          name: row.agentName,
+          total: 0,
+          complete: 0,
+          missingByField: {},
+          typeDistribution: {}
+        };
+      }
+      var agent = map[key];
+      agent.total++;
+      if (row.complete) agent.complete++;
+
+      for (var missingIndex = 0; missingIndex < row.missingLabels.length; missingIndex++) {
+        var label = row.missingLabels[missingIndex];
+        agent.missingByField[label] = (agent.missingByField[label] || 0) + 1;
+      }
+
+      var typeValue = row.fields.attendance_type && row.fields.attendance_type.filled ?
+        row.fields.attendance_type.value : 'Sem tipo';
+      agent.typeDistribution[typeValue] = (agent.typeDistribution[typeValue] || 0) + 1;
+    }
+
+    var agents = Object.keys(map).map(function (key) {
+      var agent = map[key];
+      agent.completionRate = agent.total > 0 ? (agent.complete / agent.total) * 100 : 0;
+      agent.topType = topDistribution(agent.typeDistribution);
+      return agent;
+    });
+
+    agents.sort(function (a, b) {
+      return b.total - a.total || a.completionRate - b.completionRate ||
+        String(a.name).localeCompare(String(b.name), 'pt-BR');
+    });
+    return agents;
+  }
+
+  function topDistribution(distribution) {
+    var best = { label: '—', count: 0 };
+    Object.keys(distribution || {}).forEach(function (label) {
+      var count = distribution[label];
+      if (count > best.count) best = { label: label, count: count };
+    });
+    return best;
+  }
+
+  function summarizeTotals(rows, agents, fieldStats) {
+    var complete = rows.filter(function (row) { return row.complete; }).length;
+    var totals = {
+      conversations: rows.length,
+      complete: complete,
+      completionRate: rows.length ? (complete / rows.length) * 100 : 0,
+      agents: agents.length,
+      missingByField: {}
+    };
+    Object.keys(fieldStats).forEach(function (key) {
+      totals.missingByField[fieldStats[key].label] = fieldStats[key].missing;
+    });
+    return totals;
+  }
+
+  function collectKeyDiagnostics(conversations) {
+    var result = {
+      'conversation.custom_attributes': {},
+      'conversation.additional_attributes': {},
+      'conversation.meta.custom_attributes': {},
+      'conversation.meta': {}
+    };
+    var sample = conversations.slice(0, DIAGNOSTIC_SAMPLE_SIZE);
+    for (var i = 0; i < sample.length; i++) {
+      var conversation = sample[i];
+      countObjectKeys(result['conversation.custom_attributes'], conversation.custom_attributes);
+      countObjectKeys(result['conversation.additional_attributes'], conversation.additional_attributes);
+      var meta = conversation.meta || {};
+      countObjectKeys(result['conversation.meta.custom_attributes'], meta.custom_attributes);
+      countObjectKeys(result['conversation.meta'], meta);
+    }
+    return result;
+  }
+
+  function countObjectKeys(bag, obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+    Object.keys(obj).forEach(function (key) {
+      bag[key] = (bag[key] || 0) + 1;
+    });
+  }
+
+  function fetchReportData(days, inboxId) {
+    var accountId = getActiveAccountId() || '0';
+    var cacheKey = accountId + '_' + days + '_ib' + (inboxId || 'all');
+    var cached = cacheGet(cacheKey);
+    if (cached) return Promise.resolve(cached);
+
+    return fetchResolvedConversations(days, inboxId).then(function (listResult) {
+      return fetchConversationDetails(listResult.conversations).then(function (detailResult) {
+        var built = buildRows(detailResult.conversations);
+        var agents = aggregateAgents(built.rows);
+        var totals = summarizeTotals(built.rows, agents, built.fieldStats);
+        var warnings = [];
+
+        if (listResult.limited) {
+          warnings.push('A busca atingiu o limite de ' + MAX_PAGES + ' páginas de conversas resolvidas. O relatório pode estar parcial.');
+        }
+        if (detailResult.limited) {
+          warnings.push('Foram encontradas mais de ' + MAX_DETAIL_CONVERSATIONS + ' conversas resolvidas no período; somente as primeiras foram detalhadas.');
+        }
+        if (detailResult.failed > 0) {
+          warnings.push(detailResult.failed + ' conversa' + (detailResult.failed === 1 ? '' : 's') + ' não tiveram detalhe carregado e podem aparecer com campos ausentes.');
+        }
+        if (listResult.usedFallbackDate) {
+          warnings.push('Algumas conversas não informaram resolved_at/closed_at; nesses casos o filtro usou última atividade ou atualização.');
+        }
+
+        var data = {
+          days: days,
+          period: periodLabel(days),
+          inboxId: inboxId || null,
+          range: listResult.range,
+          rows: built.rows,
+          agents: agents,
+          totals: totals,
+          fieldStats: built.fieldStats,
+          diagnostics: collectKeyDiagnostics(detailResult.conversations),
+          warnings: warnings,
+          fetchedPages: listResult.pageCount
+        };
+        cacheSet(cacheKey, data);
+        return data;
+      });
+    });
+  }
+
+  function badgeHtml(ok, text) {
+    return '<span class="erfr-badge ' + (ok ? 'erfr-badge-ok' : 'erfr-badge-bad') + '">' + esc(text) + '</span>';
+  }
+
+  function buildSummaryCards(data) {
+    var cards = [
+      { label: 'Resolvidas no período', value: data.totals.conversations.toLocaleString('pt-BR') },
+      { label: 'Com os 4 campos preenchidos', value: data.totals.complete.toLocaleString('pt-BR') },
+      { label: 'Taxa de preenchimento', value: formatPercent(data.totals.completionRate) },
+      { label: 'Agentes com resoluções', value: data.totals.agents.toLocaleString('pt-BR') }
+    ];
+    var html = '<div class="erfr-kpi-grid">';
+    for (var i = 0; i < cards.length; i++) {
+      html += '<div class="erfr-kpi"><div class="erfr-kpi-value">' + esc(cards[i].value) +
+        '</div><div class="erfr-kpi-label">' + esc(cards[i].label) + '</div></div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function missingSummaryHtml(missingByField) {
+    var parts = [];
+    Object.keys(missingByField || {}).forEach(function (label) {
+      var count = missingByField[label];
+      if (count > 0) parts.push('<span class="erfr-badge erfr-badge-warn">' + esc(label) + ': ' + count + '</span>');
+    });
+    if (!parts.length) return '<span class="erfr-muted">Sem ausências</span>';
+    return '<div class="erfr-missing-list">' + parts.join('') + '</div>';
+  }
+
+  function buildAgentTable(data) {
+    if (!data.agents.length) return '<div class="erfr-empty">Nenhuma conversa resolvida encontrada neste período.</div>';
+    var html = '<div class="erfr-table-wrap"><table class="erfr-table"><thead><tr>' +
+      '<th>Agente</th><th>Resolvidas</th><th>Completas</th><th>Preenchimento</th><th>Tipo mais comum</th><th>Campos ausentes</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < data.agents.length; i++) {
+      var agent = data.agents[i];
+      var rateClass = agent.completionRate >= 95 ? 'erfr-badge-ok' : (agent.completionRate >= 75 ? 'erfr-badge-warn' : 'erfr-badge-bad');
+      html += '<tr>' +
+        '<td><strong>' + esc(agent.name) + '</strong></td>' +
+        '<td>' + agent.total.toLocaleString('pt-BR') + '</td>' +
+        '<td>' + agent.complete.toLocaleString('pt-BR') + '</td>' +
+        '<td><span class="erfr-badge ' + rateClass + '">' + esc(formatPercent(agent.completionRate)) + '</span></td>' +
+        '<td><div class="erfr-field-preview" title="' + escAttr(agent.topType.label) + '">' + esc(agent.topType.label) + ' <span class="erfr-muted">(' + agent.topType.count + ')</span></div></td>' +
+        '<td>' + missingSummaryHtml(agent.missingByField) + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  function buildDetailTable(data) {
+    if (!data.rows.length) return '<div class="erfr-empty">Nenhuma conversa resolvida encontrada neste período.</div>';
+    var html = '<div class="erfr-table-wrap"><table class="erfr-table"><thead><tr>' +
+      '<th>Conversa</th><th>Contato</th><th>Agente</th><th>Resolvida em</th><th>Status</th>' +
+      '<th>Tipo de Atendimento</th><th>Relato original</th><th>Problema real</th><th>Solução aplicada</th><th>Ausências</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < data.rows.length; i++) {
+      var row = data.rows[i];
+      var url = '/app/accounts/' + encodeURIComponent(getActiveAccountId()) + '/conversations/' + encodeURIComponent(row.id);
+      html += '<tr>' +
+        '<td><a class="erfr-link" href="' + escAttr(url) + '" target="_blank" rel="noopener">#' + esc(row.id) + '</a></td>' +
+        '<td><div class="erfr-field-preview" title="' + escAttr(row.contact) + '">' + esc(row.contact) + '</div></td>' +
+        '<td><div class="erfr-field-preview" title="' + escAttr(row.agentName) + '">' + esc(row.agentName) + '</div></td>' +
+        '<td><span title="Fonte: ' + escAttr(row.resolvedSource || 'indisponível') + '">' + esc(formatDateTime(row.resolvedAt)) + '</span></td>' +
+        '<td>' + badgeHtml(row.complete, row.complete ? 'Completa' : 'Incompleta') + '</td>' +
+        '<td><div class="erfr-field-preview" title="' + escAttr(row.fields.attendance_type.value || '—') + '">' + esc(row.fields.attendance_type.value || '—') + '</div></td>' +
+        '<td><div class="erfr-field-preview" title="' + escAttr(row.fields.original_report.value || '—') + '">' + esc(row.fields.original_report.value || '—') + '</div></td>' +
+        '<td><div class="erfr-field-preview" title="' + escAttr(row.fields.real_problem.value || '—') + '">' + esc(row.fields.real_problem.value || '—') + '</div></td>' +
+        '<td><div class="erfr-field-preview" title="' + escAttr(row.fields.applied_solution.value || '—') + '">' + esc(row.fields.applied_solution.value || '—') + '</div></td>' +
+        '<td>' + (row.missingLabels.length ? missingSummaryHtml(labelCountMap(row.missingLabels)) : '<span class="erfr-muted">—</span>') + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  function labelCountMap(labels) {
+    var map = {};
+    for (var i = 0; i < labels.length; i++) map[labels[i]] = 1;
+    return map;
+  }
+
+  function sortedKeyList(keyMap) {
+    return Object.keys(keyMap || {}).sort(function (a, b) {
+      return keyMap[b] - keyMap[a] || a.localeCompare(b, 'pt-BR');
+    }).slice(0, 18).map(function (key) {
+      return key + ' (' + keyMap[key] + ')';
+    });
+  }
+
+  function buildDiagnostics(data) {
+    var missingMapping = [];
+    if (data.rows.length > 0) {
+      Object.keys(data.fieldStats).forEach(function (key) {
+        var stat = data.fieldStats[key];
+        if (!Object.keys(stat.matches).length) missingMapping.push(stat.label);
+      });
+    }
+
+    var html = '';
+    if (missingMapping.length) {
+      html += '<div class="erfr-warning"><strong>Campos ainda sem chave encontrada:</strong> ' +
+        esc(missingMapping.join(', ')) + '. Use as chaves abaixo para ajustar o FIELD_CONFIG do script.</div>';
+    }
+    if (data.warnings.length) {
+      for (var warningIndex = 0; warningIndex < data.warnings.length; warningIndex++) {
+        html += '<div class="erfr-warning">' + esc(data.warnings[warningIndex]) + '</div>';
+      }
+    }
+
+    html += '<div class="erfr-diagnostics">';
+    Object.keys(data.diagnostics).forEach(function (sourceName) {
+      var keys = sortedKeyList(data.diagnostics[sourceName]);
+      html += '<div class="erfr-diagnostic-box"><h4>' + esc(sourceName) + '</h4>' +
+        '<div class="erfr-code-list">' + (keys.length ? esc(keys.join(', ')) : '<span class="erfr-muted">Nenhuma chave na amostra</span>') + '</div></div>';
+    });
+    html += '</div>';
+
+    html += '<div style="margin-top:12px" class="erfr-diagnostics">';
+    Object.keys(data.fieldStats).forEach(function (fieldKey) {
+      var stat = data.fieldStats[fieldKey];
+      var matches = sortedKeyList(stat.matches);
+      html += '<div class="erfr-diagnostic-box"><h4>' + esc(stat.label) + '</h4>' +
+        '<div class="erfr-code-list">' + (matches.length ? esc(matches.join(', ')) : '<span class="erfr-muted">Sem correspondência</span>') + '</div></div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
+  function buildReportHtml(data) {
+    var html = buildSummaryCards(data);
+    html += '<div class="erfr-section-title">Preenchimento por agente</div>';
+    html += '<div class="erfr-card">' + buildAgentTable(data) + '</div>';
+    html += '<div class="erfr-section-title">Detalhe por conversa</div>';
+    html += '<div class="erfr-card">' + buildDetailTable(data) + '</div>';
+    html += '<div class="erfr-section-title">Diagnóstico de chaves dos campos</div>';
+    html += '<div class="erfr-card"><h3>Mapeamento encontrado na amostra</h3>' + buildDiagnostics(data) + '</div>';
+    return html;
+  }
+
+  function csvCell(value) {
+    var text = value == null ? '' : String(value).replace(/\r?\n/g, ' ');
+    if (/[;"\r\n]/.test(text)) return '"' + text.replace(/"/g, '""') + '"';
+    return text;
+  }
+
+  function buildCsv(data) {
+    var headers = [
+      'Periodo',
+      'Conta',
+      'Inbox',
+      'Agente',
+      'Conversa',
+      'Contato',
+      'Resolvido em',
+      'Completo',
+      'Campos ausentes',
+      'Tipo de Atendimento',
+      'O que o cliente relatou originalmente?',
+      'Qual o problema real encontrado?',
+      'Qual solução foi aplicada?'
+    ];
+    var accountId = getActiveAccountId() || '';
+    var inboxLabel = getSelectedInboxLabel();
+    var lines = [headers.map(csvCell).join(';')];
+    for (var i = 0; i < data.rows.length; i++) {
+      var row = data.rows[i];
+      lines.push([
+        data.period,
+        accountId,
+        inboxLabel,
+        row.agentName,
+        row.id,
+        row.contact,
+        formatDateTime(row.resolvedAt),
+        row.complete ? 'Sim' : 'Não',
+        row.missingLabels.join(', '),
+        row.fields.attendance_type.value,
+        row.fields.original_report.value,
+        row.fields.real_problem.value,
+        row.fields.applied_solution.value
+      ].map(csvCell).join(';'));
+    }
+    return 'sep=;\r\n' + lines.join('\r\n');
+  }
+
+  function getSelectedInboxLabel() {
+    var select = document.querySelector('#' + OVERLAY_ID + ' #erfr-inbox-select');
+    if (!select) return currentInboxId ? String(currentInboxId) : 'Todas as caixas';
+    var option = select.options[select.selectedIndex];
+    return option ? option.textContent : 'Todas as caixas';
+  }
+
+  function downloadCsv() {
+    if (!currentReport) return;
+    var csv = '\ufeff' + buildCsv(currentReport);
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement('a');
+    var stamp = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = 'relatorio-campos-resolucao-' + stamp + '.csv';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function renderReport(days, inboxId) {
+    currentDays = days;
+    currentInboxId = inboxId || null;
+    currentReport = null;
+
+    var existing = document.getElementById(OVERLAY_ID);
+    if (existing) existing.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = OVERLAY_ID;
+    overlay.innerHTML =
+      '<div class="erfr-header">' +
+        '<div class="erfr-title">' +
+          '<h1>Relatório de Campos de Resolução</h1>' +
+          '<span>Conversas resolvidas por agente</span>' +
+        '</div>' +
+        '<div class="erfr-header-right">' +
+          '<select class="erfr-inbox-select" id="erfr-inbox-select"><option value="">Todas as caixas</option></select>' +
+          '<button class="erfr-period-btn' + (days === 0 ? ' active' : '') + '" data-days="0">Hoje</button>' +
+          '<button class="erfr-period-btn' + (days === 1 ? ' active' : '') + '" data-days="1">Ontem</button>' +
+          '<button class="erfr-period-btn' + (days === 7 ? ' active' : '') + '" data-days="7">7 dias</button>' +
+          '<button class="erfr-period-btn' + (days === 30 ? ' active' : '') + '" data-days="30">30 dias</button>' +
+          '<button class="erfr-period-btn' + (days === 90 ? ' active' : '') + '" data-days="90">90 dias</button>' +
+          '<button class="erfr-action-btn" id="erfr-export-btn" disabled>Exportar CSV</button>' +
+          '<button class="erfr-close-btn" title="Fechar">×</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="erfr-content"><div class="erfr-loading"><div class="erfr-spinner"></div>Carregando conversas resolvidas…</div></div>';
+    document.body.appendChild(overlay);
+
+    var content = overlay.querySelector('.erfr-content');
+    var exportBtn = overlay.querySelector('#erfr-export-btn');
+    var inboxSelect = overlay.querySelector('#erfr-inbox-select');
+
+    fetchInboxes().then(function (inboxes) {
+      for (var i = 0; i < inboxes.length; i++) {
+        var option = document.createElement('option');
+        option.value = inboxes[i].id;
+        option.textContent = inboxes[i].name || ('Inbox #' + inboxes[i].id);
+        if (String(inboxes[i].id) === String(currentInboxId)) option.selected = true;
+        inboxSelect.appendChild(option);
+      }
+    });
+
+    inboxSelect.addEventListener('change', function () {
+      var value = inboxSelect.value ? parseInt(inboxSelect.value, 10) : null;
+      renderReport(currentDays, value);
+    });
+
+    overlay.querySelector('.erfr-close-btn').addEventListener('click', function () {
+      overlay.remove();
+    });
+
+    overlay.querySelectorAll('.erfr-period-btn').forEach(function (button) {
+      button.addEventListener('click', function () {
+        renderReport(parseInt(button.getAttribute('data-days'), 10), currentInboxId);
+      });
+    });
+
+    exportBtn.addEventListener('click', downloadCsv);
+
+    function onEsc(event) {
+      if (event.key === 'Escape') {
+        overlay.remove();
+        document.removeEventListener('keydown', onEsc);
+      }
+    }
+    document.addEventListener('keydown', onEsc);
+
+    fetchReportData(days, currentInboxId).then(function (data) {
+      currentReport = data;
+      exportBtn.disabled = data.rows.length === 0;
+      content.innerHTML = buildReportHtml(data);
+    }).catch(function (error) {
+      content.innerHTML = '<div class="erfr-error"><strong>Erro ao carregar relatório</strong><span>' + esc(error.message) + '</span></div>';
+    });
+  }
+
+  function injectButton() {
+    if (!getActiveAccountId()) return;
+    if (document.getElementById(BUTTON_ID)) return;
+
+    var sidebar = document.querySelector('.primary--sidebar') ||
+      document.querySelector('.sidebar-menu') ||
+      document.querySelector('[class*="SidebarIcon"]') ||
+      document.querySelector('aside');
+    if (!sidebar) return;
+
+    var navContainer = sidebar.querySelector('.menu--container') ||
+      sidebar.querySelector('nav') ||
+      sidebar;
+
+    var button = document.createElement('button');
+    button.id = BUTTON_ID;
+    button.title = 'Relatório de campos de resolução';
+    button.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" ' +
+        'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/>' +
+        '<path d="M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v0a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2z"/>' +
+        '<path d="M9 12h6"/><path d="M9 16h6"/>' +
+      '</svg>';
+    button.addEventListener('click', function () {
+      renderReport(30, currentInboxId);
+    });
+    navContainer.appendChild(button);
+  }
+
+  function init() {
+    injectButton();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  var observer = new MutationObserver(function () {
+    setTimeout(injectButton, 150);
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  setInterval(function () {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      setTimeout(injectButton, 350);
+    }
+  }, 1000);
+})();
+</script>

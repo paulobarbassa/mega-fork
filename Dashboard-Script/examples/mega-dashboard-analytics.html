@@ -1,0 +1,2080 @@
+<script>
+/* ==========================================================================
+   MEGA - ANALYTICS DE ATENDIMENTO
+   Painel flutuante com métricas de qualidade: conversas resolvidas por
+   agente, tempo médio de resposta e satisfação CSAT. Acessível via botão
+   fixo na interface. Usa a API nativa do Mega e Chart.js (via CDN) para
+   renderizar os gráficos — sem outras dependências externas.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: ajuste CACHE_TTL_MS (padrão 5 min) e CHART_JS_URL se
+   preferir hospedar o Chart.js localmente.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /* ── Configuração ─────────────────────────────────────────────────── */
+  var CACHE_TTL_MS   = 5 * 60 * 1000; // 5 minutos
+  var CHART_JS_URL   = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js';
+
+  /* ── Prevenção de duplicação ──────────────────────────────────────── */
+  var STYLE_ID  = 'enge-dashboard-analytics-style';
+  var BUTTON_ID = 'enge-dashboard-analytics-btn';
+  var OVERLAY_ID = 'enge-dashboard-analytics-overlay';
+  if (document.getElementById(STYLE_ID)) return;
+
+  /* ── Detectar conta na URL ────────────────────────────────────────── */
+  function getAccountId() {
+    var m = location.pathname.match(/\/app\/accounts\/(\d+)/);
+    return m ? m[1] : null;
+  }
+  var accountId = getAccountId();
+  if (!accountId) return;
+
+  /* ── Acesso ao Vuex store ─────────────────────────────────────────── */
+  function getStore() {
+    try {
+      var app = document.getElementById('app');
+      if (app && app.__vue_app__) {
+        return app.__vue_app__.config.globalProperties.$store;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function getToken() {
+    if (typeof window.authToken === 'string' && window.authToken) {
+      return window.authToken;
+    }
+    try {
+      var store = getStore();
+      if (!store) return null;
+      var user =
+        store.getters['auth/getCurrentUser'] ||
+        store.getters.getCurrentUser;
+      return (user && user.access_token) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /* ── CSS ──────────────────────────────────────────────────────────── */
+  var style = document.createElement('style');
+  style.id = STYLE_ID;
+  style.textContent = [
+    '#' + OVERLAY_ID + ' {',
+    '  position: fixed; top: 0; left: 0; right: 0; bottom: 0;',
+    '  z-index: 99999; overflow-y: auto;',
+    '  background: var(--b-50, #f8fafc);',
+    '  color: var(--s-900, #111827);',
+    '  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;',
+    '  font-size: 14px; line-height: 1.5;',
+    '  padding: 0;',
+    '}',
+    '.dark #' + OVERLAY_ID + ' {',
+    '  background: var(--b-900, #0f172a);',
+    '  color: var(--s-100, #f1f5f9);',
+    '}',
+    /* Header */
+    '.eda-header {',
+    '  position: sticky; top: 0; z-index: 10;',
+    '  display: flex; align-items: center; justify-content: space-between;',
+    '  padding: 16px 24px;',
+    '  background: var(--w-500, #1f93ff);',
+    '  color: #fff; gap: 12px;',
+    '}',
+    '.eda-header h1 { margin: 0; font-size: 18px; font-weight: 600; }',
+    '.eda-header-right { display: flex; align-items: center; gap: 8px; }',
+    '.eda-period-btn {',
+    '  padding: 4px 12px; border-radius: 6px; border: 1px solid rgba(255,255,255,.3);',
+    '  background: transparent; color: #fff; cursor: pointer; font-size: 13px;',
+    '  transition: background .15s;',
+    '}',
+    '.eda-period-btn:hover { background: rgba(255,255,255,.15); }',
+    '.eda-period-btn.active { background: rgba(255,255,255,.25); font-weight: 600; }',
+    '.eda-close-btn {',
+    '  width: 32px; height: 32px; border-radius: 6px; border: none;',
+    '  background: rgba(255,255,255,.2); color: #fff; cursor: pointer;',
+    '  font-size: 18px; display: flex; align-items: center; justify-content: center;',
+    '  transition: background .15s;',
+    '}',
+    '.eda-close-btn:hover { background: rgba(255,255,255,.35); }',
+    /* Content */
+    '.eda-content { padding: 24px; max-width: 1400px; margin: 0 auto; }',
+    /* KPI cards */
+    '.eda-kpi-grid {',
+    '  display: grid;',
+    '  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));',
+    '  gap: 16px; margin-bottom: 24px;',
+    '}',
+    '.eda-kpi {',
+    '  background: var(--white, #fff); border-radius: 12px;',
+    '  padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.08);',
+    '  text-align: center;',
+    '}',
+    '.dark .eda-kpi { background: var(--b-800, #1e293b); }',
+    '.eda-kpi-value {',
+    '  font-size: 28px; font-weight: 700;',
+    '  color: var(--w-500, #1f93ff); margin-bottom: 4px;',
+    '}',
+    '.eda-kpi-label { font-size: 12px; color: var(--s-500, #6b7280); text-transform: uppercase; letter-spacing: .5px; }',
+    /* Charts grid */
+    '.eda-charts-grid {',
+    '  display: grid;',
+    '  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));',
+    '  gap: 20px; margin-bottom: 24px;',
+    '}',
+    '.eda-card {',
+    '  background: var(--white, #fff); border-radius: 12px;',
+    '  padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.08);',
+    '}',
+    '.dark .eda-card { background: var(--b-800, #1e293b); }',
+    '.eda-card h3 {',
+    '  margin: 0 0 16px; font-size: 15px; font-weight: 600;',
+    '  display: flex; align-items: center; gap: 8px;',
+    '}',
+    '.eda-card canvas { max-height: 280px; }',
+    /* Tables */
+    '.eda-table { width: 100%; border-collapse: collapse; font-size: 13px; }',
+    '.eda-table th {',
+    '  text-align: left; padding: 8px 12px; font-weight: 600;',
+    '  border-bottom: 2px solid var(--s-200, #e2e8f0);',
+    '  font-size: 11px; text-transform: uppercase; letter-spacing: .5px;',
+    '  color: var(--s-500, #6b7280);',
+    '}',
+    '.dark .eda-table th { border-bottom-color: var(--s-700, #334155); }',
+    '.eda-th-help {',
+    '  display: inline-flex; align-items: center; justify-content: center;',
+    '  width: 15px; height: 15px; margin-left: 5px; border-radius: 50%;',
+    '  border: 1px solid currentColor; font-size: 10px; font-weight: 700;',
+    '  line-height: 1; opacity: .7; cursor: help; vertical-align: middle;',
+    '}',
+    '.eda-th-help:hover { opacity: 1; }',
+    '.eda-table td { padding: 8px 12px; border-bottom: 1px solid var(--s-100, #f1f5f9); }',
+    '.dark .eda-table td { border-bottom-color: var(--s-800, #1e293b); }',
+    '.eda-table tr:hover td { background: var(--s-50, #f8fafc); }',
+    '.dark .eda-table tr:hover td { background: var(--b-700, #334155); }',
+    '.eda-rank {',
+    '  display: inline-flex; align-items: center; justify-content: center;',
+    '  width: 24px; height: 24px; border-radius: 50%; font-weight: 700;',
+    '  font-size: 11px; margin-right: 6px;',
+    '}',
+    '.eda-rank-1 { background: #fbbf24; color: #78350f; }',
+    '.eda-rank-2 { background: #d1d5db; color: #374151; }',
+    '.eda-rank-3 { background: #f59e0b; color: #78350f; }',
+    '.eda-rank-n { background: var(--s-200, #e5e7eb); color: var(--s-600, #4b5563); }',
+    '.dark .eda-rank-n { background: var(--s-700, #334155); color: var(--s-300, #94a3b8); }',
+    /* Stars */
+    '.eda-stars { color: #f59e0b; letter-spacing: 1px; }',
+    /* Loading */
+    '.eda-loading {',
+    '  display: flex; align-items: center; justify-content: center;',
+    '  min-height: 200px; color: var(--s-400, #9ca3af);',
+    '}',
+    '.eda-spinner {',
+    '  width: 32px; height: 32px; border: 3px solid var(--s-200, #e5e7eb);',
+    '  border-top-color: var(--w-500, #1f93ff); border-radius: 50%;',
+    '  animation: eda-spin .8s linear infinite; margin-right: 12px;',
+    '}',
+    '@keyframes eda-spin { to { transform: rotate(360deg); } }',
+    /* Error */
+    '.eda-error {',
+    '  text-align: center; padding: 40px; color: var(--r-500, #ef4444);',
+    '}',
+    /* Section title */
+    '.eda-section-title {',
+    '  font-size: 16px; font-weight: 600; margin: 32px 0 16px;',
+    '  padding-bottom: 8px; border-bottom: 2px solid var(--w-500, #1f93ff);',
+    '  display: flex; align-items: center; gap: 8px;',
+    '}',
+    /* Sidebar button */
+    '#' + BUTTON_ID + ' {',
+    '  display: flex; align-items: center; justify-content: center;',
+    '  width: 40px; height: 40px; border-radius: 10px;',
+    '  background: transparent; border: none; cursor: pointer;',
+    '  color: var(--s-500, #6b7280); transition: all .2s;',
+    '  position: relative;',
+    '}',
+    '#' + BUTTON_ID + ':hover {',
+    '  background: var(--s-100, #f1f5f9);',
+    '  color: var(--w-500, #1f93ff);',
+    '}',
+    '.dark #' + BUTTON_ID + ':hover { background: var(--b-800, #1e293b); }',
+    '#' + BUTTON_ID + ' svg { width: 22px; height: 22px; }',
+    /* Empty state */
+    '.eda-empty { text-align: center; padding: 20px; color: var(--s-400, #9ca3af); font-size: 13px; }',
+    /* Conversation list (date range view) */
+    '.eda-conv-list { display: flex; flex-direction: column; gap: 8px; }',
+    '.eda-conv-row {',
+    '  display: grid; grid-template-columns: 60px 1fr 140px 120px 90px 100px;',
+    '  gap: 12px; align-items: center; padding: 10px 14px; border-radius: 8px;',
+    '  background: var(--white, #fff); box-shadow: 0 1px 2px rgba(0,0,0,.06);',
+    '  font-size: 13px; cursor: default; transition: box-shadow .15s;',
+    '}',
+    '.dark .eda-conv-row { background: var(--b-800, #1e293b); }',
+    '.eda-conv-row:hover { box-shadow: 0 2px 8px rgba(0,0,0,.12); }',
+    '.eda-conv-id { font-weight: 700; color: var(--w-500, #1f93ff); cursor: pointer; }',
+    '.eda-conv-id a:hover { text-decoration: underline; }',
+    '.eda-conv-contact { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+    '.eda-conv-agent { font-size: 12px; color: var(--s-500, #6b7280); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+    '.eda-conv-status {',
+    '  display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;',
+    '  font-weight: 600; text-transform: uppercase; text-align: center;',
+    '}',
+    '.eda-status-open { background: #dbeafe; color: #1e40af; }',
+    '.dark .eda-status-open { background: #1e3a5f; color: #93c5fd; }',
+    '.eda-status-resolved { background: #d1fae5; color: #065f46; }',
+    '.dark .eda-status-resolved { background: #064e3b; color: #6ee7b7; }',
+    '.eda-status-pending { background: #fef3c7; color: #92400e; }',
+    '.dark .eda-status-pending { background: #78350f; color: #fcd34d; }',
+    '.eda-status-snoozed { background: #e0e7ff; color: #3730a3; }',
+    '.dark .eda-status-snoozed { background: #312e81; color: #a5b4fc; }',
+    '.eda-conv-time { font-size: 12px; color: var(--s-500, #6b7280); text-align: right; }',
+    '.eda-conv-header {',
+    '  display: grid; grid-template-columns: 60px 1fr 140px 120px 90px 100px;',
+    '  gap: 12px; padding: 6px 14px; font-size: 11px; font-weight: 600;',
+    '  text-transform: uppercase; letter-spacing: .5px; color: var(--s-500, #6b7280);',
+    '}',
+    '@media (max-width: 700px) {',
+    '  .eda-conv-row, .eda-conv-header { grid-template-columns: 50px 1fr 100px; }',
+    '  .eda-conv-agent, .eda-conv-time, .eda-conv-wait { display: none; }',
+    '}',
+    /* Waiting badge */
+    '.eda-wait-badge {',
+    '  display: inline-flex; align-items: center; gap: 4px;',
+    '  padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;',
+    '  background: #fef2f2; color: #dc2626;',
+    '  animation: eda-pulse 2s ease-in-out infinite;',
+    '}',
+    '.dark .eda-wait-badge { background: #450a0a; color: #fca5a5; }',
+    '.eda-wait-ok { background: #f0fdf4; color: #16a34a; animation: none; }',
+    '.dark .eda-wait-ok { background: #052e16; color: #86efac; }',
+    '@keyframes eda-pulse { 0%,100% { opacity:1; } 50% { opacity:.6; } }',
+    '.eda-waiting-alert {',
+    '  background: linear-gradient(135deg, #dc2626, #b91c1c); color: #fff;',
+    '  border-radius: 12px; padding: 16px 20px; margin-bottom: 16px;',
+    '  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;',
+    '  box-shadow: 0 2px 8px rgba(220,38,38,.25);',
+    '}',
+    '.eda-waiting-alert-count {',
+    '  font-size: 32px; font-weight: 700; line-height: 1;',
+    '}',
+    '.eda-waiting-alert-text { font-size: 13px; opacity: .9; }',
+    '.eda-waiting-alert-max { font-size: 13px; font-weight: 600; margin-left: auto; }',
+    /* Inbox selector */
+    '.eda-inbox-select {',
+    '  padding: 4px 28px 4px 10px; border-radius: 6px;',
+    '  border: 1px solid rgba(255,255,255,.3);',
+    '  background: rgba(255,255,255,.12); color: #fff;',
+    '  font-size: 13px; cursor: pointer;',
+    '  -webkit-appearance: none; -moz-appearance: none; appearance: none;',
+    '  background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%2712%27 height=%2712%27 fill=%27white%27 viewBox=%270 0 16 16%27%3E%3Cpath d=%27M4.646 5.646a.5.5 0 0 1 .708 0L8 8.293l2.646-2.647a.5.5 0 0 1 .708.708l-3 3a.5.5 0 0 1-.708 0l-3-3a.5.5 0 0 1 0-.708z%27/%3E%3C/svg%3E");',
+    '  background-repeat: no-repeat; background-position: right 8px center;',
+    '  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;',
+    '  transition: background .15s;',
+    '}',
+    '.eda-inbox-select:hover { background: rgba(255,255,255,.22); }',
+    '.eda-inbox-select:focus { outline: 2px solid rgba(255,255,255,.5); outline-offset: 1px; }',
+    '.eda-inbox-select option { color: #111; background: #fff; }',
+  ].join('\n');
+  document.head.appendChild(style);
+
+  /* ── Helpers ──────────────────────────────────────────────────────── */
+  function esc(str) {
+    var d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  function escAttr(str) {
+    return esc(String(str)).replace(/"/g, '&quot;');
+  }
+
+  function thHint(label, hint) {
+    var safeHint = escAttr(hint);
+    return '<th title="' + safeHint + '">' + esc(label) +
+      '<span class="eda-th-help" title="' + safeHint + '" aria-label="' + safeHint + '">?</span></th>';
+  }
+
+  function metricNumber(metric, keys) {
+    if (!metric) return null;
+    for (var i = 0; i < keys.length; i++) {
+      var value = metric[keys[i]];
+      if (value != null && value !== '') {
+        var numberValue = Number(value);
+        if (!isNaN(numberValue)) return numberValue;
+      }
+    }
+    return null;
+  }
+
+  function resolvedCount(metric) {
+    return metricNumber(metric, [
+      'resolved_conversations_count',
+      'resolutions_count',
+      'resolved_count'
+    ]);
+  }
+
+  function firstResponseMetric(metric, allowApiFallback) {
+    if (!metric) return null;
+    if (metric.local_avg_first_response_time != null) {
+      return {
+        value: metric.local_avg_first_response_time,
+        source: 'local',
+        count: metric.local_first_response_count || 0
+      };
+    }
+    if (!allowApiFallback) return null;
+    var apiValue = metricNumber(metric, ['avg_first_response_time', 'first_response_time']);
+    if (apiValue == null) return null;
+    return { value: apiValue, source: 'api', count: 0 };
+  }
+
+  function firstResponseCell(metric, allowApiFallback) {
+    var response = firstResponseMetric(metric, allowApiFallback);
+    if (!response) {
+      var pendingTitle = allowApiFallback ? 'Sem dados de primeira resposta para este técnico.' :
+        'Calculando a partir das mensagens das conversas do período.';
+      return '<span title="' + escAttr(pendingTitle) + '">—</span>';
+    }
+    var title = response.source === 'local'
+      ? 'Média recalculada pelas mensagens do período (' + response.count + ' conversa' + (response.count === 1 ? '' : 's') + ').'
+      : 'Valor retornado pelo relatório da plataforma.';
+    return '<span title="' + escAttr(title) + '">' + formatDuration(response.value) + '</span>';
+  }
+
+  function toTimestamp(value) {
+    if (value == null || value === '') return null;
+    if (typeof value === 'number') {
+      return value > 100000000000 ? Math.floor(value / 1000) : Math.floor(value);
+    }
+    var parsed = Date.parse(value);
+    return isNaN(parsed) ? null : Math.floor(parsed / 1000);
+  }
+
+  function isMessageType(message, numericType, textType) {
+    var type = message && message.message_type;
+    return type === numericType || String(type).toLowerCase() === textType;
+  }
+
+  function isIncomingMessage(message) {
+    return isMessageType(message, 0, 'incoming');
+  }
+
+  function isHumanOutgoingMessage(message) {
+    if (!isMessageType(message, 1, 'outgoing') || message.private) return false;
+    var sender = message.sender || {};
+    var senderType = String(message.sender_type || sender.type || '').toLowerCase();
+    return !senderType || senderType === 'user' || senderType === 'agent';
+  }
+
+  function messageTimestamp(message) {
+    return toTimestamp(message && (message.created_at || message.timestamp));
+  }
+
+  function getConversationId(conversation) {
+    return String(conversation && (conversation.id || conversation.display_id));
+  }
+
+  function getConversationAssignee(conversation) {
+    var meta = (conversation && conversation.meta) || {};
+    var assignee = meta.assignee || conversation.assignee || {};
+    return {
+      id: assignee.id || conversation.assignee_id || null,
+      name: assignee.name || assignee.available_name || null
+    };
+  }
+
+  function getMessageAgent(message, conversation) {
+    var sender = (message && message.sender) || {};
+    var assignee = getConversationAssignee(conversation);
+    return {
+      id: sender.id || message.sender_id || assignee.id,
+      name: sender.name || sender.available_name || assignee.name
+    };
+  }
+
+  function normalizeMessageList(response) {
+    if (Array.isArray(response)) return response;
+    if (!response) return [];
+    if (Array.isArray(response.payload)) return response.payload;
+    if (response.data && Array.isArray(response.data.payload)) return response.data.payload;
+    if (response.data && Array.isArray(response.data)) return response.data;
+    return [];
+  }
+
+  function extractMessageCount(response, messages) {
+    var meta = (response && response.meta) || (response && response.data && response.data.meta) || {};
+    return meta.all_messages_count || meta.count || messages.length || 0;
+  }
+
+  function formatDuration(seconds) {
+    if (seconds == null || seconds < 0) return '—';
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    var s = Math.round(seconds % 60);
+    if (h > 0) return h + 'h ' + m + 'm';
+    if (m > 0) return m + 'm ' + s + 's';
+    return s + 's';
+  }
+
+  function starRating(rating) {
+    var full = Math.floor(rating);
+    var half = rating - full >= 0.5;
+    var out = '';
+    for (var i = 0; i < full; i++) out += '★';
+    if (half) out += '½';
+    return '<span class="eda-stars">' + out + '</span> ' + rating.toFixed(1);
+  }
+
+  function rankBadge(i) {
+    var cls = i < 3 ? 'eda-rank-' + (i + 1) : 'eda-rank-n';
+    return '<span class="eda-rank ' + cls + '">' + (i + 1) + '</span>';
+  }
+
+  /* ── Cache ────────────────────────────────────────────────────────── */
+  function cacheGet(key) {
+    try {
+      var raw = sessionStorage.getItem('eda_' + key);
+      if (!raw) return null;
+      var obj = JSON.parse(raw);
+      if (Date.now() - obj.ts > CACHE_TTL_MS) {
+        sessionStorage.removeItem('eda_' + key);
+        return null;
+      }
+      return obj.data;
+    } catch (_) { return null; }
+  }
+
+  function cacheSet(key, data) {
+    try {
+      sessionStorage.setItem('eda_' + key, JSON.stringify({ ts: Date.now(), data: data }));
+    } catch (_) {}
+  }
+
+  /* ── Fetch helper ───────────────────────────────────────────────────── */
+  function fetchPlatformApi(path, apiVersion) {
+    var token = getToken();
+    if (!token) return Promise.reject(new Error('No auth token'));
+    var ver = apiVersion || 'v1';
+    return fetch('/api/' + ver + '/accounts/' + accountId + path, {
+      headers: { api_access_token: token }
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  /* ── Chart.js loader ──────────────────────────────────────────────── */
+  var chartJsReady = null;
+  function loadChartJs() {
+    if (window.Chart) return Promise.resolve();
+    if (chartJsReady) return chartJsReady;
+    chartJsReady = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = CHART_JS_URL;
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error('Failed to load Chart.js')); };
+      document.head.appendChild(s);
+    });
+    return chartJsReady;
+  }
+
+  /* ── Detect dark mode ─────────────────────────────────────────────── */
+  function isDarkMode() {
+    return document.body.classList.contains('dark') ||
+           document.documentElement.classList.contains('dark');
+  }
+
+  function chartColors() {
+    var dark = isDarkMode();
+    return {
+      primary:   '#1f93ff',
+      success:   '#38a169',
+      warning:   '#d69e2e',
+      danger:    '#e53e3e',
+      muted:     dark ? '#475569' : '#cbd5e1',
+      text:      dark ? '#e2e8f0' : '#334155',
+      gridColor: dark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)',
+    };
+  }
+
+  /* ── Fetch inboxes ─────────────────────────────────────────────────── */
+  var _inboxesCache = null;
+  function fetchInboxes() {
+    if (_inboxesCache) return Promise.resolve(_inboxesCache);
+    return fetchPlatformApi('/inboxes', 'v1').then(function (res) {
+      var list = Array.isArray(res) ? res : (res.payload || res.data || []);
+      _inboxesCache = list;
+      return list;
+    }).catch(function () { return []; });
+  }
+
+  /* ── Date range helpers ───────────────────────────────────────────── */
+  function isSingleDay(days) { return days === 0 || days === 1; }
+
+  function periodLabel(days) {
+    if (days === 0) return 'Hoje';
+    if (days === 1) return 'Ontem';
+    if (days > 1) return 'Últimos ' + days + ' dias';
+    return 'Período selecionado';
+  }
+
+  function dateRange(days) {
+    var now = new Date();
+    if (days === 0) {
+      /* Today: start of today → now */
+      var todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return { since: Math.floor(todayStart.getTime() / 1000), until: Math.floor(now.getTime() / 1000) };
+    }
+    if (days === 1) {
+      /* Yesterday: start of yesterday → end of yesterday */
+      var yStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+      var yEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return { since: Math.floor(yStart.getTime() / 1000), until: Math.floor(yEnd.getTime() / 1000) };
+    }
+    var since = new Date(now.getTime() - days * 86400000);
+    return {
+      since: Math.floor(since.getTime() / 1000),
+      until: Math.floor(now.getTime() / 1000),
+    };
+  }
+
+  function isTimestampInRange(timestamp, range) {
+    return timestamp != null && timestamp >= range.since && timestamp <= range.until;
+  }
+
+  function responsePayload(response) {
+    if (Array.isArray(response)) return response;
+    if (response && response.data && Array.isArray(response.data.payload)) return response.data.payload;
+    if (response && Array.isArray(response.payload)) return response.payload;
+    if (response && Array.isArray(response.data)) return response.data;
+    return [];
+  }
+
+  function getConversationActivityTimestamp(conversation) {
+    return toTimestamp(conversation && (conversation.last_activity_at || conversation.updated_at ||
+      conversation.created_at || conversation.timestamp));
+  }
+
+  function getConversationCreatedTimestamp(conversation) {
+    return toTimestamp(conversation && (conversation.created_at || conversation.timestamp));
+  }
+
+  function getConversationResolvedTimestamp(conversation) {
+    if (!conversation || conversation.status !== 'resolved') return null;
+    var sources = [
+      conversation,
+      conversation.meta,
+      conversation.additional_attributes,
+      conversation.custom_attributes
+    ];
+    var keys = [
+      'resolved_at',
+      'resolvedAt',
+      'resolved_at_ts',
+      'resolvedAtTs',
+      'resolved_at_timestamp',
+      'resolvedAtTimestamp',
+      'resolution_at',
+      'resolutionAt',
+      'closed_at',
+      'closedAt',
+      'status_changed_at',
+      'statusChangedAt',
+      'status_updated_at',
+      'statusUpdatedAt'
+    ];
+
+    for (var sourceIndex = 0; sourceIndex < sources.length; sourceIndex++) {
+      var source = sources[sourceIndex];
+      if (!source) continue;
+      for (var keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+        var timestamp = toTimestamp(source[keys[keyIndex]]);
+        if (timestamp != null) return timestamp;
+      }
+    }
+    return null;
+  }
+
+  function isConversationActivityInRange(conversation, range) {
+    return isTimestampInRange(getConversationActivityTimestamp(conversation), range) ||
+           isTimestampInRange(getConversationCreatedTimestamp(conversation), range);
+  }
+
+  function isConversationResolvedInRange(conversation, range) {
+    return isTimestampInRange(getConversationResolvedTimestamp(conversation), range);
+  }
+
+  function mergeConversationLists(lists) {
+    var seen = {};
+    var unique = [];
+    for (var listIndex = 0; listIndex < lists.length; listIndex++) {
+      var list = lists[listIndex] || [];
+      for (var itemIndex = 0; itemIndex < list.length; itemIndex++) {
+        var conversation = list[itemIndex];
+        if (!conversation) continue;
+        var id = getConversationId(conversation);
+        if (!seen[id]) {
+          seen[id] = true;
+          unique.push(conversation);
+        }
+      }
+    }
+    return unique;
+  }
+
+  /* ── Data fetching ────────────────────────────────────────────────── */
+
+  /* Fetch paginated conversations for a date range */
+  function fetchConversationsList(days, inboxId, options) {
+    options = options || {};
+    var range = dateRange(days);
+    var all = [];
+    var maxPages = 15;
+    var inboxQs = inboxId ? '&inbox_id=' + inboxId : '';
+    var mode = options.mode || 'activity';
+    var statuses = options.statuses || ['open', 'pending', 'resolved', 'snoozed'];
+
+    function isConversationInRange(conversation) {
+      if (mode === 'resolved') return isConversationResolvedInRange(conversation, range);
+      return isConversationActivityInRange(conversation, range);
+    }
+
+    function paginationTimestamp(conversation) {
+      if (mode === 'resolved') {
+        return getConversationResolvedTimestamp(conversation) || getConversationActivityTimestamp(conversation);
+      }
+      return getConversationActivityTimestamp(conversation);
+    }
+
+    function fetchStatusPage(status, page, seenOlder) {
+      var statusQs = status ? 'status=' + status + '&' : '';
+      return fetchPlatformApi('/conversations?' + statusQs + 'page=' + page + inboxQs, 'v1').then(function (res) {
+        var payload = res.data ? res.data.payload : (res.payload || []);
+        payload = responsePayload(res);
+        if (!payload || !payload.length) return all;
+
+        for (var payloadIndex = 0; payloadIndex < payload.length; payloadIndex++) {
+          var conversation = payload[payloadIndex];
+          var pageAt = paginationTimestamp(conversation);
+          if (isConversationInRange(conversation)) {
+            all.push(conversation);
+          } else if (pageAt != null && pageAt < range.since) {
+            seenOlder = true;
+          }
+        }
+
+        if (seenOlder || page >= maxPages) return all;
+        if (payload.length >= 25) return fetchStatusPage(status, page + 1, seenOlder);
+        return all;
+      });
+    }
+
+    return Promise.all(statuses.map(function (status) {
+      return fetchStatusPage(status, 1, false).catch(function () {});
+    })).then(function () {
+      return mergeConversationLists([all]);
+    }).catch(function () { return []; });
+  }
+
+  function fetchAllData(days, inboxId) {
+    var cacheKey = accountId + '_' + days + '_ib' + (inboxId || '0');
+    var cached = cacheGet(cacheKey);
+    /* Invalidate stale cache entries missing agent data */
+    if (cached && (!cached.agentsSummary || !Array.isArray(cached.agentsSummary) || cached.agentsSummary.length === 0)) {
+      console.log('[EDA] Cache invalidado (sem dados de agentes)');
+      try { sessionStorage.removeItem('eda_' + cacheKey); } catch (_) {}
+      cached = null;
+    }
+    if (cached) return Promise.resolve(cached);
+
+    var range = dateRange(days);
+    var inboxQs = inboxId ? '&inbox_id=' + inboxId : '';
+    var rp = 'since=' + range.since + '&until=' + range.until + inboxQs;
+
+    /* Helper: try v2 first, fall back to v1 */
+    function tryV2ThenV1(path) {
+      return fetchPlatformApi(path, 'v2').catch(function (e2) {
+        console.warn('[EDA] v2 falhou para ' + path + ':', e2.message);
+        return fetchPlatformApi(path, 'v1').catch(function (e1) {
+          console.warn('[EDA] v1 também falhou para ' + path + ':', e1.message);
+          return null;
+        });
+      });
+    }
+
+    function reportMetric(metric) {
+      return tryV2ThenV1('/reports?metric=' + metric +
+        '&type=account&group_by=day&' + rp);
+    }
+
+    /* Fetch per-agent summaries: get agent list, then individual reports */
+    function fetchAgentsSummary() {
+      return fetchPlatformApi('/agents', 'v1').catch(function () {
+        return fetchPlatformApi('/agents', 'v2').catch(function () { return null; });
+      }).then(function (agentsRaw) {
+        if (!agentsRaw) return null;
+        var agentList = Array.isArray(agentsRaw) ? agentsRaw :
+          (agentsRaw.data || agentsRaw.payload || []);
+        if (!agentList.length) return null;
+        console.log('[EDA] Encontrados ' + agentList.length + ' agentes, buscando métricas individuais...');
+
+        /* For each agent, fetch their summary via /reports/summary?type=agent&id=X */
+        var promises = agentList.map(function (agent) {
+          var agentId = agent.id;
+          return tryV2ThenV1('/reports/summary?' + rp + '&type=agent&id=' + agentId)
+            .then(function (summary) {
+              return {
+                id: agentId,
+                name: agent.name || agent.available_name || ('Agente #' + agentId),
+                thumbnail: agent.thumbnail,
+                metric: summary || {}
+              };
+            });
+        });
+        return Promise.all(promises);
+      });
+    }
+
+    /* Fetch CSAT: try multiple endpoint patterns */
+    function fetchCsat() {
+      return fetchPlatformApi('/satisfaction_reports?' + rp + '&page=1', 'v1')
+        .catch(function () {
+          return tryV2ThenV1('/reports/agents/ratings?' + rp);
+        })
+        .catch(function () {
+          /* Last resort: try v1 reports with satisfaction metric */
+          return tryV2ThenV1('/reports?metric=account&type=account&' + rp);
+        })
+        .catch(function () { return null; });
+    }
+
+    return Promise.all([
+      /* 0 — Account summary (KPIs globais) */
+      tryV2ThenV1('/reports/summary?' + rp + '&type=account'),
+
+      /* 1 — Agents summary (per-agent fetch) */
+      fetchAgentsSummary(),
+
+      /* 2 — Daily conversations count */
+      reportMetric('conversations_count'),
+
+      /* 3 — Daily first response time */
+      reportMetric('avg_first_response_time'),
+
+      /* 4 — Daily resolution time */
+      reportMetric('avg_resolution_time'),
+
+      /* 5 — Daily resolutions count */
+      reportMetric('resolutions_count'),
+
+      /* 6 — Daily incoming messages */
+      reportMetric('incoming_messages_count'),
+
+      /* 7 — Daily outgoing messages */
+      reportMetric('outgoing_messages_count'),
+
+      /* 8 — CSAT satisfaction reports */
+      fetchCsat(),
+
+      /* 9 — Open conversations count */
+      fetchPlatformApi('/conversations?status=open&page=1' + (inboxId ? '&inbox_id=' + inboxId : ''))
+        .catch(function () { return null; }),
+
+      /* 10 — Pending conversations count */
+      fetchPlatformApi('/conversations?status=pending&page=1' + (inboxId ? '&inbox_id=' + inboxId : ''))
+        .catch(function () { return null; }),
+    ]).then(function (results) {
+      var data = {
+        accountSummary:      results[0],
+        agentsSummary:       results[1],
+        dailyConversations:  results[2],
+        dailyFirstResponse:  results[3],
+        dailyResolution:     results[4],
+        dailyResolutions:    results[5],
+        dailyIncoming:       results[6],
+        dailyOutgoing:       results[7],
+        csatReports:         results[8],
+        openConversations:   results[9],
+        pendingConversations: results[10],
+      };
+      console.log('[EDA] fetchAllData resultados:', {
+        accountSummary: !!data.accountSummary,
+        agentsSummary: data.agentsSummary ? data.agentsSummary.length + ' agentes' : null,
+        csatReports: data.csatReports ? typeof data.csatReports : null,
+      });
+      /* Only cache if we got agent data (avoid caching partial results) */
+      if (data.agentsSummary && data.agentsSummary.length > 0) {
+        cacheSet(cacheKey, data);
+      }
+      return data;
+    });
+  }
+
+  /* ── Helper: extract conversation count from paginated response ──── */
+  function convCount(response) {
+    if (!response) return null;
+    if (response.data && response.data.meta && response.data.meta.all_count != null)
+      return response.data.meta.all_count;
+    if (response.meta && response.meta.all_count != null)
+      return response.meta.all_count;
+    var payload = response.data ? response.data.payload : (response.payload || []);
+    return payload ? payload.length : null;
+  }
+
+  /* ── Build KPI section ────────────────────────────────────────────── */
+  function buildKpis(data) {
+    var s = data.accountSummary;
+    var kpis = [];
+
+    if (s) {
+      if (s.conversations_count != null)
+        kpis.push({ value: s.conversations_count.toLocaleString('pt-BR'), label: 'Conversas no Período' });
+
+      var accountResolvedCount = resolvedCount(s);
+      if (accountResolvedCount != null) {
+        kpis.push({ value: accountResolvedCount.toLocaleString('pt-BR'), label: 'Resoluções no Período' });
+      }
+
+      if (s.avg_first_response_time != null)
+        kpis.push({ value: formatDuration(s.avg_first_response_time), label: 'Tempo Médio 1ª Resposta' });
+
+      if (s.avg_resolution_time != null)
+        kpis.push({ value: formatDuration(s.avg_resolution_time), label: 'Tempo Médio Resolução' });
+
+      if (s.incoming_messages_count != null)
+        kpis.push({ value: s.incoming_messages_count.toLocaleString('pt-BR'), label: 'Mensagens Recebidas' });
+
+      if (s.outgoing_messages_count != null)
+        kpis.push({ value: s.outgoing_messages_count.toLocaleString('pt-BR'), label: 'Mensagens Enviadas' });
+    }
+
+    /* Live counters: open / pending */
+    var openCount = convCount(data.openConversations);
+    if (openCount != null)
+      kpis.push({ value: openCount.toLocaleString('pt-BR'), label: 'Abertas Agora' });
+
+    var pendingCount = convCount(data.pendingConversations);
+    if (pendingCount != null)
+      kpis.push({ value: pendingCount.toLocaleString('pt-BR'), label: 'Pendentes Agora' });
+
+    if (kpis.length === 0) {
+      kpis.push({ value: '—', label: 'Sem dados disponíveis' });
+    }
+
+    var html = '<div class="eda-kpi-grid">';
+    for (var i = 0; i < kpis.length; i++) {
+      html += '<div class="eda-kpi"><div class="eda-kpi-value">' +
+        esc(String(kpis[i].value)) +
+        '</div><div class="eda-kpi-label">' + esc(kpis[i].label) + '</div></div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  /* ── Helper: normalize agent list from different API shapes ──────── */
+  function normalizeAgentList(raw) {
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'object') {
+      /* Try common platform response wrappers */
+      if (Array.isArray(raw.data)) return raw.data;
+      if (Array.isArray(raw.agents)) return raw.agents;
+      if (Array.isArray(raw.payload)) return raw.payload;
+      if (Array.isArray(raw.results)) return raw.results;
+      /* Some versions return {meta:{}, data:[]} inside a wrapper */
+      if (raw.data && Array.isArray(raw.data.data)) return raw.data.data;
+      /* If it's a single-key object wrapping an array, extract it */
+      var keys = Object.keys(raw);
+      if (keys.length === 1 && Array.isArray(raw[keys[0]])) return raw[keys[0]];
+      /* If it has agent-like properties, wrap it as a single-element array */
+      if (raw.conversations_count != null || raw.name) return [raw];
+      console.warn('[EDA] normalizeAgentList: formato desconhecido:', JSON.stringify(raw).substring(0, 300));
+    }
+    return [];
+  }
+
+  /* ── Build agent ranking table ────────────────────────────────────── */
+  function buildAgentRanking(data, options) {
+    options = options || {};
+    var agents = data.agentsSummary;
+    console.log('[EDA] agentsSummary:', agents);
+    if (!agents || !Array.isArray(agents) || agents.length === 0) {
+      return '<div class="eda-empty">Dados de agentes indisponíveis</div>';
+    }
+
+    /* Sort by total conversations (metric object from per-agent fetch) */
+    agents.sort(function (a, b) {
+      var ca = (a.metric && a.metric.conversations_count) || 0;
+      var cb = (b.metric && b.metric.conversations_count) || 0;
+      return cb - ca;
+    });
+
+    /* Filter out agents with zero activity */
+    var active = agents.filter(function (a) {
+      var m = a.metric || {};
+      var resolved = resolvedCount(m) || 0;
+      return (m.conversations_count || 0) > 0 ||
+             resolved > 0;
+    });
+    if (active.length === 0) active = agents;
+
+    var html = '<table class="eda-table"><thead><tr>' +
+      thHint('#', 'Posição no ranking, ordenada pela quantidade de atendimentos.') +
+      thHint('Técnico', 'Agente vinculado às conversas do período.') +
+      thHint('Atendimentos', 'Total de conversas atribuídas ao técnico no relatório do período. Não é contagem de mensagens nem de clientes únicos.') +
+      thHint('Resolvidas', 'Resoluções feitas pelo técnico no período conforme o relatório da plataforma. Não depende da data de abertura da conversa.') +
+      thHint('1ª Resposta', 'Tempo médio até a primeira resposta humana após a primeira mensagem recebida no período. Recalculado pelas mensagens quando disponível; não é soma.') +
+      thHint('Resolução', 'Tempo médio até a conversa ser resolvida. Não é soma; conversas antigas abertas por muito tempo aumentam bastante essa média.') +
+      '</tr></thead><tbody>';
+
+    for (var i = 0; i < Math.min(active.length, 15); i++) {
+      var a = active[i];
+      var name = a.name || 'Agente #' + (a.id || i);
+      var m = a.metric || {};
+      var resolved = resolvedCount(m);
+
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>' + esc(name) + '</td>' +
+        '<td><strong>' + (m.conversations_count || 0) + '</strong></td>' +
+        '<td>' + (resolved != null ? resolved.toLocaleString('pt-BR') : '—') + '</td>' +
+        '<td>' + firstResponseCell(m, !options.deferFirstResponse) + '</td>' +
+        '<td>' + formatDuration(m.avg_resolution_time) + '</td>' +
+        '</tr>';
+    }
+
+    html += '</tbody></table>';
+    return html;
+  }
+
+  /* ── Build CSAT ranking table ─────────────────────────────────────── */
+  function buildCsatRanking(data) {
+    var ratings = data.csatReports;
+    console.log('[EDA] csatReports raw:', ratings);
+    if (!ratings) return '<div class="eda-empty">CSAT não disponível nesta instância</div>';
+
+    var list = Array.isArray(ratings) ? ratings : (ratings.data || ratings.agents || []);
+    if (!list || list.length === 0) {
+      return '<div class="eda-empty">CSAT não ativo ou sem dados no período</div>';
+    }
+
+    /* Aggregate scores by agent */
+    var agentMap = {};
+    for (var j = 0; j < list.length; j++) {
+      var item = list[j];
+      /* satisfaction_reports returns individual entries; agents/ratings returns aggregated */
+      var agentName = item.name || (item.agent && item.agent.name) ||
+                      (item.assigned_agent && item.assigned_agent.name) || null;
+      if (!agentName) {
+        /* Individual CSAT entry — has rating directly */
+        var score = item.rating || item.satisfaction_score || item.avg_rating || 0;
+        var total = item.total_count || item.total_responses || item.count || 1;
+        agentName = agentName || 'Agente';
+        if (!agentMap[agentName]) agentMap[agentName] = { sum: 0, count: 0 };
+        agentMap[agentName].sum += score * total;
+        agentMap[agentName].count += total;
+        continue;
+      }
+      var s2 = item.rating || item.satisfaction_score || item.avg_rating || 0;
+      var t2 = item.total_count || item.total_responses || item.count || 1;
+      if (!agentMap[agentName]) agentMap[agentName] = { sum: 0, count: 0 };
+      agentMap[agentName].sum += s2 * t2;
+      agentMap[agentName].count += t2;
+    }
+
+    var sorted = Object.keys(agentMap).map(function (name) {
+      var e = agentMap[name];
+      return { name: name, avg: e.count > 0 ? e.sum / e.count : 0, total: e.count };
+    }).sort(function (a, b) { return b.avg - a.avg; });
+
+    if (sorted.length === 0) {
+      return '<div class="eda-empty">CSAT não ativo ou sem dados no período</div>';
+    }
+
+    var html = '<table class="eda-table"><thead><tr>' +
+      '<th>#</th><th>Técnico</th><th>Avaliação</th><th>Total Respostas</th>' +
+      '</tr></thead><tbody>';
+
+    for (var i = 0; i < Math.min(sorted.length, 10); i++) {
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>' + esc(sorted[i].name) + '</td>' +
+        '<td>' + starRating(sorted[i].avg) + '</td>' +
+        '<td>' + sorted[i].total + '</td>' +
+        '</tr>';
+    }
+
+    html += '</tbody></table>';
+    return html;
+  }
+
+  /* ── Build team ranking table ─────────────────────────────────────── */
+  function buildTeamRanking(data) {
+    var teams = normalizeAgentList(data.teamsSummary);
+    if (teams.length === 0) return '';
+
+    teams.sort(function (a, b) {
+      var ca = (a.metric || a).conversations_count || 0;
+      var cb = (b.metric || b).conversations_count || 0;
+      return cb - ca;
+    });
+
+    var html = '<div class="eda-card"><h3>👥 Ranking por Equipe</h3>' +
+      '<table class="eda-table"><thead><tr>' +
+      '<th>#</th><th>Equipe</th><th>Atendimentos</th>' +
+      '<th>Resolvidas</th><th>Resolução</th>' +
+      '</tr></thead><tbody>';
+
+    for (var i = 0; i < Math.min(teams.length, 10); i++) {
+      var t = teams[i];
+      var name = t.name || (t.team && t.team.name) || 'Equipe #' + (t.id || i);
+      var m = t.metric || t;
+
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>' + esc(name) + '</td>' +
+        '<td><strong>' + (m.conversations_count || 0) + '</strong></td>' +
+        '<td>' + (m.resolved_conversations_count != null ? m.resolved_conversations_count : '—') + '</td>' +
+        '<td>' + formatDuration(m.avg_resolution_time) + '</td>' +
+        '</tr>';
+    }
+
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  /* ── Build inbox ranking table ────────────────────────────────────── */
+  function buildInboxRanking(data) {
+    var inboxes = normalizeAgentList(data.inboxesSummary);
+    if (inboxes.length === 0) return '';
+
+    inboxes.sort(function (a, b) {
+      var ca = (a.metric || a).conversations_count || 0;
+      var cb = (b.metric || b).conversations_count || 0;
+      return cb - ca;
+    });
+
+    var html = '<div class="eda-card"><h3>📬 Ranking por Canal</h3>' +
+      '<table class="eda-table"><thead><tr>' +
+      '<th>#</th><th>Canal / Inbox</th><th>Conversas</th>' +
+      '<th>1ª Resposta</th><th>Resolução</th>' +
+      '</tr></thead><tbody>';
+
+    for (var i = 0; i < Math.min(inboxes.length, 10); i++) {
+      var ib = inboxes[i];
+      var name = ib.name || (ib.inbox && ib.inbox.name) || 'Inbox #' + (ib.id || i);
+      var m = ib.metric || ib;
+
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>' + esc(name) + '</td>' +
+        '<td><strong>' + (m.conversations_count || 0) + '</strong></td>' +
+        '<td>' + formatDuration(m.avg_first_response_time) + '</td>' +
+        '<td>' + formatDuration(m.avg_resolution_time) + '</td>' +
+        '</tr>';
+    }
+
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  /* ── Build CSAT detail block ──────────────────────────────────────── */
+  function buildCsatDetail(data) {
+    var ratings = data.csatReports;
+    if (!ratings) return '';
+
+    var list = Array.isArray(ratings) ? ratings : (ratings.data || []);
+    if (!list || list.length === 0) return '';
+
+    /* Count by rating value */
+    var buckets = { great: 0, good: 0, neutral: 0, bad: 0 };
+    var total = 0;
+    var sum = 0;
+
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i].rating || list[i].satisfaction_score || 0;
+      if (r <= 0) continue;
+      total++;
+      sum += r;
+      if (r >= 4.5) buckets.great++;
+      else if (r >= 3.5) buckets.good++;
+      else if (r >= 2.5) buckets.neutral++;
+      else buckets.bad++;
+    }
+
+    if (total === 0) return '';
+
+    var avg = (sum / total).toFixed(1);
+
+    var html = '<div class="eda-card" style="grid-column: 1 / -1;">' +
+      '<h3>📋 Detalhamento CSAT</h3>' +
+      '<div style="display:flex;align-items:center;gap:32px;flex-wrap:wrap;">' +
+        '<div style="text-align:center;min-width:120px;">' +
+          '<div class="eda-kpi-value" style="font-size:36px;">' + esc(avg) + '</div>' +
+          '<div class="eda-kpi-label">Score Médio</div>' +
+          '<div style="margin-top:4px;">' + starRating(parseFloat(avg)) + '</div>' +
+        '</div>' +
+        '<div style="flex:1;min-width:200px;">' +
+          '<canvas id="eda-chart-csat-dist"></canvas>' +
+        '</div>' +
+        '<div style="min-width:140px;text-align:center;">' +
+          '<div class="eda-kpi-value">' + total + '</div>' +
+          '<div class="eda-kpi-label">Total de Respostas</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+
+    return html;
+  }
+
+  /* ── Build conversation list ───────────────────────────────────── */
+  function statusLabel(status) {
+    var map = {
+      open: { text: 'Aberta', cls: 'eda-status-open' },
+      resolved: { text: 'Resolvida', cls: 'eda-status-resolved' },
+      pending: { text: 'Pendente', cls: 'eda-status-pending' },
+      snoozed: { text: 'Adiada', cls: 'eda-status-snoozed' },
+    };
+    var info = map[status] || { text: status || '—', cls: 'eda-status-open' };
+    return '<span class="eda-conv-status ' + info.cls + '">' + esc(info.text) + '</span>';
+  }
+
+  function formatTime(ts) {
+    if (!ts) return '—';
+    var d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+
+  /* Compute wait time: seconds since client is waiting for a response */
+  function getWaitSeconds(conv) {
+    /* waiting_since is set when the last incoming msg has no reply */
+    var ws = conv.waiting_since;
+    if (ws) {
+      var wsTs = typeof ws === 'number' ? ws : Math.floor(new Date(ws).getTime() / 1000);
+      if (wsTs > 0) return Math.floor(Date.now() / 1000) - wsTs;
+    }
+    /* Fallback: check last_non_activity_message */
+    var lastMsg = conv.last_non_activity_message;
+    if (lastMsg && lastMsg.message_type === 0 /* incoming */) {
+      var msgTs = lastMsg.created_at || 0;
+      if (typeof msgTs !== 'number') msgTs = Math.floor(new Date(msgTs).getTime() / 1000);
+      if (msgTs > 0) return Math.floor(Date.now() / 1000) - msgTs;
+    }
+    return 0;
+  }
+
+  function formatWait(seconds) {
+    if (!seconds || seconds <= 0) return null;
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    if (h > 0) return h + 'h ' + m + 'm';
+    if (m > 0) return m + 'min';
+    return '< 1min';
+  }
+
+  function waitBadge(seconds) {
+    var txt = formatWait(seconds);
+    if (!txt) return '<span class="eda-wait-badge eda-wait-ok">✓</span>';
+    var isUrgent = seconds >= 1800; /* 30+ min */
+    return '<span class="eda-wait-badge' + (isUrgent ? '' : ' eda-wait-ok') + '">' +
+      (isUrgent ? '⏰ ' : '') + esc(txt) + '</span>';
+  }
+
+  function buildConversationList(conversations, options) {
+    options = options || {};
+    var visibleConversations = (conversations || []).slice();
+    if (options.excludeResolved) {
+      visibleConversations = visibleConversations.filter(function (conversation) {
+        return conversation.status !== 'resolved';
+      });
+    }
+    if (visibleConversations.length === 0) {
+      return '<div class="eda-empty">' + esc(options.emptyMessage || 'Nenhuma conversa encontrada neste período') + '</div>';
+    }
+
+    /* Sort: conversations waiting for response first (longest wait first), then by created_at desc */
+    visibleConversations.sort(function (a, b) {
+      var wa = (a.status !== 'resolved') ? getWaitSeconds(a) : 0;
+      var wb = (b.status !== 'resolved') ? getWaitSeconds(b) : 0;
+      if (wa > 0 && wb > 0) return wb - wa; /* both waiting — longest first */
+      if (wa > 0) return -1; /* a is waiting, b is not */
+      if (wb > 0) return 1;  /* b is waiting, a is not */
+      var ta = a.created_at || a.timestamp || 0;
+      var tb = b.created_at || b.timestamp || 0;
+      return tb - ta;
+    });
+
+    /* Summary counters */
+    var counts = { open: 0, resolved: 0, pending: 0, snoozed: 0 };
+    var waitingCount = 0;
+    var maxWait = 0;
+    for (var j = 0; j < visibleConversations.length; j++) {
+      var st = visibleConversations[j].status || 'open';
+      if (counts[st] != null) counts[st]++;
+      if (st !== 'resolved') {
+        var ws = getWaitSeconds(visibleConversations[j]);
+        if (ws > 0) {
+          waitingCount++;
+          if (ws > maxWait) maxWait = ws;
+        }
+      }
+    }
+
+    var html = '';
+
+    /* Waiting alert banner */
+    if (waitingCount > 0) {
+      html += '<div class="eda-waiting-alert">' +
+        '<div class="eda-waiting-alert-count">' + waitingCount + '</div>' +
+        '<div style="flex:1">' +
+          '<div style="font-weight:600;font-size:14px;">⚠ Clientes aguardando resposta</div>' +
+          '<div class="eda-waiting-alert-text">' + waitingCount + ' conversa' +
+            (waitingCount > 1 ? 's' : '') + ' sem resposta da equipe</div>' +
+        '</div>' +
+        '<div class="eda-waiting-alert-max">Maior espera: ' + esc(formatWait(maxWait) || '—') + '</div>' +
+      '</div>';
+    }
+
+    function summaryPart(count, singular, plural, color) {
+      return '<span style="color:' + color + ';">' + count + ' ' + (count === 1 ? singular : plural) + '</span>';
+    }
+
+    var totalLabel = '<strong>' + visibleConversations.length + '</strong> conversa' +
+      (visibleConversations.length === 1 ? '' : 's');
+    if (options.excludeResolved) {
+      totalLabel += ' não resolvida' + (visibleConversations.length === 1 ? '' : 's');
+    }
+    var summaryParts = [
+      summaryPart(counts.open, 'aberta', 'abertas', '#1e40af')
+    ];
+    if (!options.excludeResolved) {
+      summaryParts.push(summaryPart(counts.resolved, 'resolvida', 'resolvidas', '#065f46'));
+    }
+    summaryParts.push(summaryPart(counts.pending, 'pendente', 'pendentes', '#92400e'));
+    if (counts.snoozed) {
+      summaryParts.push(summaryPart(counts.snoozed, 'adiada', 'adiadas', '#3730a3'));
+    }
+
+    html += '<div style="margin-bottom:12px;font-size:13px;color:var(--s-500,#6b7280);">' +
+      totalLabel + ' &mdash; ' + summaryParts.join(', ') +
+      '</div>';
+
+    html += '<div class="eda-conv-header">' +
+      '<div>#</div><div>Contato</div><div>Agente</div><div>Status</div><div>Espera</div><div>Hora</div>' +
+      '</div>';
+    html += '<div class="eda-conv-list">';
+
+    for (var i = 0; i < visibleConversations.length; i++) {
+      var c = visibleConversations[i];
+      var contact = (c.meta && c.meta.sender && c.meta.sender.name) || 'Sem nome';
+      var agent = (c.meta && c.meta.assignee && c.meta.assignee.name) || '—';
+      var convId = c.id || c.display_id || (i + 1);
+      var created = c.created_at || c.timestamp;
+      var waitSec = (c.status !== 'resolved') ? getWaitSeconds(c) : 0;
+
+      var convUrl = '/app/accounts/' + accountId + '/conversations/' + convId;
+      html += '<div class="eda-conv-row">' +
+        '<div class="eda-conv-id"><a href="' + convUrl + '" target="_blank" title="Abrir conversa #' + esc(String(convId)) + '" style="color:inherit;text-decoration:none;">#' + esc(String(convId)) + ' ↗</a></div>' +
+        '<div class="eda-conv-contact">' + esc(contact) + '</div>' +
+        '<div class="eda-conv-agent">' + esc(agent) + '</div>' +
+        '<div>' + statusLabel(c.status) + '</div>' +
+        '<div class="eda-conv-wait">' + (c.status !== 'resolved' ? waitBadge(waitSec) : '<span style="color:var(--s-400,#9ca3af);font-size:11px;">—</span>') + '</div>' +
+        '<div class="eda-conv-time">' + formatTime(created) + '</div>' +
+        '</div>';
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  /* ── Fetch messages for a batch of conversations ──────────────── */
+  function fetchConversationMessageData(conversations) {
+    var maxConversations = 300;
+    var concurrency = 6;
+    var slice = conversations.slice(0, maxConversations);
+    var result = {
+      counts: {},
+      messages: {},
+      limited: conversations.length > slice.length
+    };
+    var nextIndex = 0;
+
+    function fetchNext() {
+      if (nextIndex >= slice.length) return Promise.resolve();
+      var conversation = slice[nextIndex++];
+      var conversationId = getConversationId(conversation);
+      return fetchPlatformApi('/conversations/' + conversationId + '/messages?page=1', 'v1')
+        .then(function (response) {
+          var messages = normalizeMessageList(response);
+          result.messages[conversationId] = messages;
+          result.counts[conversationId] = extractMessageCount(response, messages);
+        })
+        .catch(function () {
+          result.messages[conversationId] = [];
+          result.counts[conversationId] = 0;
+        })
+        .then(fetchNext);
+    }
+
+    var workers = [];
+    var workerCount = Math.min(concurrency, slice.length);
+    for (var workerIndex = 0; workerIndex < workerCount; workerIndex++) {
+      workers.push(fetchNext());
+    }
+    return Promise.all(workers).then(function () { return result; });
+  }
+
+  function fetchMessageCounts(conversations) {
+    return fetchConversationMessageData(conversations).then(function (messageData) {
+      return messageData.counts;
+    });
+  }
+
+  function applyLocalFirstResponseMetrics(data, conversations, messageData, days) {
+    if (!data || !Array.isArray(data.agentsSummary) || !messageData) return;
+    var range = dateRange(days);
+    var byAgentId = {};
+    var byAgentName = {};
+
+    for (var agentIndex = 0; agentIndex < data.agentsSummary.length; agentIndex++) {
+      var agent = data.agentsSummary[agentIndex];
+      if (agent.id != null) byAgentId[String(agent.id)] = agent;
+      if (agent.name) byAgentName[String(agent.name).toLowerCase()] = agent;
+      agent.metric = agent.metric || {};
+      delete agent.metric.local_avg_first_response_time;
+      delete agent.metric.local_first_response_count;
+    }
+
+    var accumulator = {};
+
+    for (var conversationIndex = 0; conversationIndex < conversations.length; conversationIndex++) {
+      var conversation = conversations[conversationIndex];
+      var conversationId = getConversationId(conversation);
+      var messages = (messageData.messages[conversationId] || []).slice().sort(function (left, right) {
+        return (messageTimestamp(left) || 0) - (messageTimestamp(right) || 0);
+      });
+      var firstIncomingAt = null;
+      var firstResponseAt = null;
+      var responseAgent = null;
+
+      for (var messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+        var message = messages[messageIndex];
+        var createdAt = messageTimestamp(message);
+        if (!createdAt || createdAt < range.since || createdAt > range.until) continue;
+
+        if (firstIncomingAt == null && isIncomingMessage(message)) {
+          firstIncomingAt = createdAt;
+          continue;
+        }
+        if (firstIncomingAt != null && isHumanOutgoingMessage(message)) {
+          firstResponseAt = createdAt;
+          responseAgent = getMessageAgent(message, conversation);
+          break;
+        }
+      }
+
+      if (firstIncomingAt == null || firstResponseAt == null || !responseAgent) continue;
+      var responseSeconds = firstResponseAt - firstIncomingAt;
+      if (responseSeconds < 0) continue;
+
+      var agentKey = responseAgent.id != null ? 'id:' + responseAgent.id :
+        (responseAgent.name ? 'name:' + String(responseAgent.name).toLowerCase() : null);
+      if (!agentKey) continue;
+      if (!accumulator[agentKey]) {
+        accumulator[agentKey] = { sum: 0, count: 0, agent: responseAgent };
+      }
+      accumulator[agentKey].sum += responseSeconds;
+      accumulator[agentKey].count++;
+    }
+
+    Object.keys(accumulator).forEach(function (agentKey) {
+      var entry = accumulator[agentKey];
+      var agent = entry.agent.id != null ? byAgentId[String(entry.agent.id)] : null;
+      if (!agent && entry.agent.name) {
+        agent = byAgentName[String(entry.agent.name).toLowerCase()];
+      }
+      if (!agent) return;
+      agent.metric.local_avg_first_response_time = Math.round(entry.sum / entry.count);
+      agent.metric.local_first_response_count = entry.count;
+    });
+  }
+
+  function updateAgentRankingCard(content, data, options) {
+    var card = content && content.querySelector('#eda-agent-ranking-card');
+    if (!card) return;
+    card.innerHTML = '<h3>Ranking de Técnicos (Atendimentos)</h3>' + buildAgentRanking(data, options || {});
+  }
+
+  function resolutionRankingUnavailable(conversations, expectedResolutions, hasLocalResolutions) {
+    if (!expectedResolutions || hasLocalResolutions) return false;
+    for (var i = 0; i < conversations.length; i++) {
+      if (getConversationResolvedTimestamp(conversations[i]) != null) return false;
+    }
+    return true;
+  }
+
+  /* ── Aggregate contact rankings from conversations ─────────────── */
+  function aggregateContactRankings(conversations, msgCountMap, options) {
+    options = options || {};
+    var range = options.range;
+    var expectedResolutions = options.expectedResolutions || 0;
+    var contactMap = {};
+    for (var i = 0; i < conversations.length; i++) {
+      var c = conversations[i];
+      var sender = c.meta && c.meta.sender;
+      var contactName = (sender && sender.name) || 'Sem nome';
+      var contactId = (sender && sender.id) || contactName;
+      var key = String(contactId);
+      if (!contactMap[key]) {
+        contactMap[key] = { name: contactName, resolutions: 0, messages: 0, conversations: 0 };
+      }
+      contactMap[key].conversations++;
+      if (range ? isConversationResolvedInRange(c, range) : c.status === 'resolved') {
+        contactMap[key].resolutions++;
+      }
+      var cid = String(c.id || c.display_id);
+      contactMap[key].messages += (msgCountMap[cid] || 0);
+    }
+    var list = Object.keys(contactMap).map(function (k) { return contactMap[k]; });
+    /* If API returned no message counts at all, use conversations as proxy */
+    var hasMessages = list.some(function (e) { return e.messages > 0; });
+    if (!hasMessages) {
+      for (var j = 0; j < list.length; j++) list[j].messages = list[j].conversations;
+    }
+    var byResolutions = list.slice().sort(function (a, b) { return b.resolutions - a.resolutions; });
+    var byMessages = list.slice().sort(function (a, b) {
+      return b.messages - a.messages || b.conversations - a.conversations;
+    });
+    var hasLocalResolutions = list.some(function (e) { return e.resolutions > 0; });
+    return {
+      byResolutions: byResolutions,
+      byMessages: byMessages,
+      usedProxy: !hasMessages,
+      resolutionUnavailable: resolutionRankingUnavailable(conversations, expectedResolutions, hasLocalResolutions)
+    };
+  }
+
+  /* ── Aggregate label rankings from conversations ──────────────── */
+  function aggregateLabelRankings(conversations, msgCountMap, options) {
+    options = options || {};
+    var range = options.range;
+    var expectedResolutions = options.expectedResolutions || 0;
+    var labelMap = {};
+    for (var i = 0; i < conversations.length; i++) {
+      var c = conversations[i];
+      var labels = c.labels || [];
+      var cid = String(c.id || c.display_id);
+      var mc = msgCountMap[cid] || 0;
+      for (var j = 0; j < labels.length; j++) {
+        var label = labels[j];
+        if (!labelMap[label]) {
+          labelMap[label] = { name: label, resolutions: 0, messages: 0, conversations: 0 };
+        }
+        labelMap[label].conversations++;
+        if (range ? isConversationResolvedInRange(c, range) : c.status === 'resolved') {
+          labelMap[label].resolutions++;
+        }
+        labelMap[label].messages += mc;
+      }
+    }
+    var list = Object.keys(labelMap).map(function (k) { return labelMap[k]; });
+    var hasMessages = list.some(function (e) { return e.messages > 0; });
+    if (!hasMessages) {
+      for (var j = 0; j < list.length; j++) list[j].messages = list[j].conversations;
+    }
+    var byResolutions = list.slice().sort(function (a, b) { return b.resolutions - a.resolutions; });
+    var byMessages = list.slice().sort(function (a, b) {
+      return b.messages - a.messages || b.conversations - a.conversations;
+    });
+    var hasLocalResolutions = list.some(function (e) { return e.resolutions > 0; });
+    return {
+      byResolutions: byResolutions,
+      byMessages: byMessages,
+      usedProxy: !hasMessages,
+      resolutionUnavailable: resolutionRankingUnavailable(conversations, expectedResolutions, hasLocalResolutions)
+    };
+  }
+
+  /* ── Build contact resolutions ranking table ──────────────────── */
+  function buildContactResolutionsRanking(rankings) {
+    var list = rankings.byResolutions.filter(function (c) { return c.resolutions > 0; });
+    if (list.length === 0 && rankings.resolutionUnavailable) {
+      return '<div class="eda-empty">O relatório registra resoluções, mas a API de conversas não informou data de resolução para este ranking.</div>';
+    }
+    if (list.length === 0) return '<div class="eda-empty">Nenhum contato com resoluções no período</div>';
+    var html = '<table class="eda-table"><thead><tr>' +
+      '<th>#</th><th>Contato</th><th>Resoluções</th><th>Conversas</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < Math.min(list.length, 15); i++) {
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>' + esc(list[i].name) + '</td>' +
+        '<td><strong>' + list[i].resolutions + '</strong></td>' +
+        '<td>' + list[i].conversations + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    return html;
+  }
+
+  /* ── Build contact messages ranking table ─────────────────────── */
+  function buildContactMessagesRanking(rankings) {
+    var list = rankings.byMessages.filter(function (c) { return c.messages > 0; });
+    if (list.length === 0) return '<div class="eda-empty">Sem dados de mensagens de contatos no período</div>';
+    var msgLabel = rankings.usedProxy ? 'Conversas' : 'Mensagens';
+    var html = '<table class="eda-table"><thead><tr>' +
+      '<th>#</th><th>Contato</th><th>' + msgLabel + '</th><th>Conversas</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < Math.min(list.length, 15); i++) {
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>' + esc(list[i].name) + '</td>' +
+        '<td><strong>' + list[i].messages + '</strong></td>' +
+        '<td>' + list[i].conversations + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    return html;
+  }
+
+  /* ── Build label resolutions ranking table ────────────────────── */
+  function buildLabelResolutionsRanking(rankings) {
+    var list = rankings.byResolutions.filter(function (l) { return l.resolutions > 0; });
+    if (list.length === 0 && rankings.resolutionUnavailable) {
+      return '<div class="eda-empty">O relatório registra resoluções, mas a API de conversas não informou data de resolução para este ranking.</div>';
+    }
+    if (list.length === 0) return '<div class="eda-empty">Nenhuma etiqueta com resoluções no período</div>';
+    var html = '<table class="eda-table"><thead><tr>' +
+      '<th>#</th><th>Etiqueta</th><th>Resoluções</th><th>Conversas</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < Math.min(list.length, 15); i++) {
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>\uD83C\uDFF7\uFE0F ' + esc(list[i].name) + '</td>' +
+        '<td><strong>' + list[i].resolutions + '</strong></td>' +
+        '<td>' + list[i].conversations + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    return html;
+  }
+
+  /* ── Build label messages ranking table ───────────────────────── */
+  function buildLabelMessagesRanking(rankings) {
+    var list = rankings.byMessages.filter(function (l) { return l.messages > 0; });
+    if (list.length === 0) return '<div class="eda-empty">Sem dados de mensagens com etiquetas no período</div>';
+    var msgLabel = rankings.usedProxy ? 'Conversas' : 'Mensagens';
+    var html = '<table class="eda-table"><thead><tr>' +
+      '<th>#</th><th>Etiqueta</th><th>' + msgLabel + '</th><th>Conversas</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < Math.min(list.length, 15); i++) {
+      html += '<tr>' +
+        '<td>' + rankBadge(i) + '</td>' +
+        '<td>\uD83C\uDFF7\uFE0F ' + esc(list[i].name) + '</td>' +
+        '<td><strong>' + list[i].messages + '</strong></td>' +
+        '<td>' + list[i].conversations + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    return html;
+  }
+
+  /* ── Render contact & label rankings from conversations ──────── */
+  function buildContactLabelRankingsHtml(conversations, msgCountMap, options) {
+    options = options || {};
+    var contactRankings = aggregateContactRankings(conversations, msgCountMap, options);
+    var labelRankings = aggregateLabelRankings(conversations, msgCountMap, options);
+    var h = '';
+    h += '<div class="eda-section-title">\uD83D\uDC64 Rankings de Contatos</div>';
+    h += '<div class="eda-charts-grid">';
+    h += '<div class="eda-card"><h3>\uD83C\uDFC6 Contatos com Mais Resoluções</h3>' + buildContactResolutionsRanking(contactRankings) + '</div>';
+    h += '<div class="eda-card"><h3>\uD83D\uDCAC Contatos com Mais Mensagens</h3>' + buildContactMessagesRanking(contactRankings) + '</div>';
+    h += '</div>';
+    h += '<div class="eda-section-title">\uD83C\uDFF7\uFE0F Rankings de Etiquetas</div>';
+    h += '<div class="eda-charts-grid">';
+    h += '<div class="eda-card"><h3>\uD83C\uDFC6 Etiquetas com Mais Resoluções</h3>' + buildLabelResolutionsRanking(labelRankings) + '</div>';
+    h += '<div class="eda-card"><h3>\uD83D\uDCAC Etiquetas com Mais Mensagens</h3>' + buildLabelMessagesRanking(labelRankings) + '</div>';
+    h += '</div>';
+    return h;
+  }
+
+  /* ── Helper: extract time series from platform report response ───── */
+  function extractSeries(reportData) {
+    if (!reportData) return null;
+    /* Array of { value: N, timestamp: T } */
+    if (Array.isArray(reportData) && reportData.length > 0 && reportData[0].timestamp != null) {
+      var labels = [];
+      var values = [];
+      for (var i = 0; i < reportData.length; i++) {
+        var d = new Date(reportData[i].timestamp * 1000);
+        labels.push(String(d.getDate()).padStart(2, '0') + '/' +
+                     String(d.getMonth() + 1).padStart(2, '0'));
+        values.push(reportData[i].value || 0);
+      }
+      return { labels: labels, values: values };
+    }
+    /* Already { labels, values } */
+    if (reportData.labels && reportData.values) return reportData;
+    return null;
+  }
+
+  /* ── Render charts ────────────────────────────────────────────────── */
+  function renderCharts(data, container) {
+    loadChartJs().then(function () {
+      var colors = chartColors();
+      var Chart = window.Chart;
+
+      Chart.defaults.color = colors.text;
+      Chart.defaults.borderColor = colors.gridColor;
+
+      /* 1 — Volume diário de conversas */
+      var volEl = container.querySelector('#eda-chart-volume');
+      if (volEl) {
+        var convSeries = extractSeries(data.dailyConversations);
+        var resSeries = extractSeries(data.dailyResolutions);
+
+        if (convSeries) {
+          var datasets = [{
+            label: 'Conversas',
+            data: convSeries.values,
+            borderColor: colors.primary,
+            backgroundColor: colors.primary + '20',
+            fill: true, tension: 0.3,
+          }];
+          if (resSeries) {
+            datasets.push({
+              label: 'Resolvidas',
+              data: resSeries.values,
+              borderColor: colors.success,
+              backgroundColor: colors.success + '20',
+              fill: true, tension: 0.3,
+            });
+          }
+          new Chart(volEl, {
+            type: 'line',
+            data: { labels: convSeries.labels, datasets: datasets },
+            options: {
+              responsive: true,
+              plugins: { legend: { position: 'bottom' } },
+              scales: { y: { beginAtZero: true } },
+            },
+          });
+        }
+      }
+
+      /* 2 — Tempos de resposta */
+      var respEl = container.querySelector('#eda-chart-response-times');
+      if (respEl) {
+        var frtSeries = extractSeries(data.dailyFirstResponse);
+        var resTmSeries = extractSeries(data.dailyResolution);
+
+        if (frtSeries || resTmSeries) {
+          var base = frtSeries || resTmSeries;
+          var dsResp = [];
+          if (frtSeries) {
+            dsResp.push({
+              label: '1ª Resposta (min)',
+              data: frtSeries.values.map(function (v) { return Math.round(v / 60); }),
+              borderColor: colors.warning,
+              backgroundColor: colors.warning + '20',
+              fill: false, tension: 0.3,
+            });
+          }
+          if (resTmSeries) {
+            dsResp.push({
+              label: 'Resolução (min)',
+              data: resTmSeries.values.map(function (v) { return Math.round(v / 60); }),
+              borderColor: colors.danger,
+              backgroundColor: colors.danger + '20',
+              fill: false, tension: 0.3,
+            });
+          }
+          new Chart(respEl, {
+            type: 'line',
+            data: { labels: base.labels, datasets: dsResp },
+            options: {
+              responsive: true,
+              plugins: { legend: { position: 'bottom' } },
+              scales: { y: { beginAtZero: true, title: { display: true, text: 'minutos' } } },
+            },
+          });
+        }
+      }
+
+      /* 3 — Mensagens recebidas vs enviadas */
+      var msgEl = container.querySelector('#eda-chart-messages');
+      if (msgEl) {
+        var inSeries = extractSeries(data.dailyIncoming);
+        var outSeries = extractSeries(data.dailyOutgoing);
+
+        if (inSeries || outSeries) {
+          var baseMsg = inSeries || outSeries;
+          var dsMsg = [];
+          if (inSeries) {
+            dsMsg.push({
+              label: 'Recebidas',
+              data: inSeries.values,
+              backgroundColor: colors.primary + '90',
+              borderRadius: 4,
+            });
+          }
+          if (outSeries) {
+            dsMsg.push({
+              label: 'Enviadas',
+              data: outSeries.values,
+              backgroundColor: colors.success + '90',
+              borderRadius: 4,
+            });
+          }
+          new Chart(msgEl, {
+            type: 'bar',
+            data: { labels: baseMsg.labels, datasets: dsMsg },
+            options: {
+              responsive: true,
+              plugins: { legend: { position: 'bottom' } },
+              scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } },
+            },
+          });
+        }
+      }
+
+      /* 4 — Resoluções por dia */
+      var resEl = container.querySelector('#eda-chart-resolutions');
+      if (resEl) {
+        var resChartSeries = extractSeries(data.dailyResolutions);
+        if (resChartSeries) {
+          new Chart(resEl, {
+            type: 'bar',
+            data: {
+              labels: resChartSeries.labels,
+              datasets: [{
+                label: 'Resolvidas',
+                data: resChartSeries.values,
+                backgroundColor: colors.success + '80',
+                borderRadius: 4,
+              }],
+            },
+            options: {
+              responsive: true,
+              plugins: { legend: { display: false } },
+              scales: { y: { beginAtZero: true } },
+            },
+          });
+        }
+      }
+
+      /* 5 — CSAT distribution doughnut */
+      var csatDistEl = container.querySelector('#eda-chart-csat-dist');
+      if (csatDistEl) {
+        var ratings = data.csatReports;
+        var cList = ratings ? (Array.isArray(ratings) ? ratings : (ratings.data || [])) : [];
+        var buckets = { 'Ótimo (4-5)': 0, 'Bom (3-4)': 0, 'Neutro (2-3)': 0, 'Ruim (1-2)': 0 };
+        for (var ci = 0; ci < cList.length; ci++) {
+          var rv = cList[ci].rating || cList[ci].satisfaction_score || 0;
+          if (rv <= 0) continue;
+          if (rv >= 4) buckets['Ótimo (4-5)']++;
+          else if (rv >= 3) buckets['Bom (3-4)']++;
+          else if (rv >= 2) buckets['Neutro (2-3)']++;
+          else buckets['Ruim (1-2)']++;
+        }
+        var bLabels = Object.keys(buckets);
+        var bValues = bLabels.map(function (k) { return buckets[k]; });
+        if (bValues.some(function (v) { return v > 0; })) {
+          new Chart(csatDistEl, {
+            type: 'doughnut',
+            data: {
+              labels: bLabels,
+              datasets: [{
+                data: bValues,
+                backgroundColor: [colors.success, colors.primary, colors.warning, colors.danger],
+              }],
+            },
+            options: {
+              responsive: true,
+              plugins: { legend: { position: 'bottom' } },
+            },
+          });
+        }
+      }
+
+    }).catch(function (err) {
+      console.warn('[Dashboard Analytics] Chart.js failed to load:', err);
+    });
+  }
+
+  /* ── Main render ──────────────────────────────────────────────────── */
+  var _currentInboxId = null; /* null = all inboxes */
+
+  function renderDashboard(days, inboxId) {
+    if (inboxId !== undefined) _currentInboxId = inboxId;
+    var selectedInbox = _currentInboxId;
+
+    /* Close existing */
+    var existing = document.getElementById(OVERLAY_ID);
+    if (existing) existing.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = OVERLAY_ID;
+
+    /* Header */
+    overlay.innerHTML =
+      '<div class="eda-header">' +
+        '<h1>📊 Dashboard de Atendimento</h1>' +
+        '<div class="eda-header-right">' +
+          '<select class="eda-inbox-select" id="eda-inbox-select">' +
+            '<option value="">Todas as caixas</option>' +
+          '</select>' +
+          '<button class="eda-period-btn' + (days === 0 ? ' active' : '') +
+            '" data-days="0">Hoje</button>' +
+          '<button class="eda-period-btn' + (days === 1 ? ' active' : '') +
+            '" data-days="1">Ontem</button>' +
+          '<button class="eda-period-btn' + (days === 7 ? ' active' : '') +
+            '" data-days="7">7 dias</button>' +
+          '<button class="eda-period-btn' + (days === 30 ? ' active' : '') +
+            '" data-days="30">30 dias</button>' +
+          '<button class="eda-period-btn' + (days === 90 ? ' active' : '') +
+            '" data-days="90">90 dias</button>' +
+          '<button class="eda-close-btn" title="Fechar">✕</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="eda-content">' +
+        '<div class="eda-loading"><div class="eda-spinner"></div>Carregando dados…</div>' +
+      '</div>';
+
+    /* Populate inbox selector */
+    var inboxSelect = overlay.querySelector('#eda-inbox-select');
+    fetchInboxes().then(function (inboxes) {
+      for (var i = 0; i < inboxes.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = inboxes[i].id;
+        opt.textContent = inboxes[i].name || ('Inbox #' + inboxes[i].id);
+        if (String(inboxes[i].id) === String(selectedInbox)) opt.selected = true;
+        inboxSelect.appendChild(opt);
+      }
+    });
+    inboxSelect.addEventListener('change', function () {
+      var val = inboxSelect.value ? parseInt(inboxSelect.value, 10) : null;
+      renderDashboard(days, val);
+    });
+
+    document.body.appendChild(overlay);
+
+    /* Event: close */
+    overlay.querySelector('.eda-close-btn').addEventListener('click', function () {
+      overlay.remove();
+    });
+
+    /* Event: period buttons */
+    overlay.querySelectorAll('.eda-period-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var d = parseInt(btn.getAttribute('data-days'), 10);
+        overlay.remove();
+        renderDashboard(d, selectedInbox);
+      });
+    });
+
+    /* Event: Escape key */
+    function onEsc(e) {
+      if (e.key === 'Escape') {
+        overlay.remove();
+        document.removeEventListener('keydown', onEsc);
+      }
+    }
+    document.addEventListener('keydown', onEsc);
+
+    /* Fetch & render */
+    var content = overlay.querySelector('.eda-content');
+
+    fetchAllData(days, selectedInbox).then(function (data) {
+      var html = '';
+      var singleDay = isSingleDay(days);
+      var selectedPeriodLabel = periodLabel(days);
+
+      /* KPI cards */
+      html += buildKpis(data);
+
+      /* Conversation list for every period; resolved conversations are hidden from this list. */
+      html += '<div class="eda-section-title">📝 Conversas - ' + esc(selectedPeriodLabel) + '</div>';
+      html += '<div class="eda-loading" id="eda-conv-loading"><div class="eda-spinner"></div>Carregando conversas…</div>';
+
+      if (!singleDay) {
+        /* ── Multi-day view: charts + rankings ── */
+
+        /* Charts section — Volume & Tempos */
+        html += '<div class="eda-section-title">📈 Volume e Tempos de Resposta</div>';
+        html += '<div class="eda-charts-grid">';
+        html += '<div class="eda-card"><h3>Conversas por Dia</h3><canvas id="eda-chart-volume"></canvas></div>';
+        html += '<div class="eda-card"><h3>Tempos de Resposta (evolução)</h3><canvas id="eda-chart-response-times"></canvas></div>';
+        html += '</div>';
+
+        /* Charts section — Messages & Resolutions */
+        html += '<div class="eda-charts-grid">';
+        html += '<div class="eda-card"><h3>Mensagens Recebidas vs Enviadas</h3><canvas id="eda-chart-messages"></canvas></div>';
+        html += '<div class="eda-card"><h3>Resoluções por Dia</h3><canvas id="eda-chart-resolutions"></canvas></div>';
+        html += '</div>';
+      }
+
+      /* Rankings section */
+      html += '<div class="eda-section-title">🏆 Rankings de Agentes</div>';
+      html += '<div class="eda-charts-grid">';
+
+      /* Agent ranking */
+      html += '<div class="eda-card" id="eda-agent-ranking-card"><h3>Ranking de Técnicos (Atendimentos)</h3>';
+      html += buildAgentRanking(data, { deferFirstResponse: true });
+      html += '</div>';
+
+      /* CSAT ranking */
+      html += '<div class="eda-card"><h3>⭐ Top Técnicos (Avaliação CSAT)</h3>';
+      html += buildCsatRanking(data);
+      html += '</div>';
+
+      html += '</div>'; /* end eda-charts-grid */
+
+      /* Placeholder for contact & label rankings */
+      html += '<div id="eda-contact-label-rankings"><div class="eda-loading"><div class="eda-spinner"></div>Carregando rankings de contatos e etiquetas…</div></div>';
+
+      if (!singleDay) {
+        /* CSAT Detail section */
+        var csatHtml = buildCsatDetail(data);
+        if (csatHtml) {
+          html += '<div class="eda-section-title">📋 Satisfação (CSAT)</div>';
+          html += '<div class="eda-charts-grid">';
+          html += csatHtml;
+          html += '</div>';
+        }
+      }
+
+      content.innerHTML = html;
+
+      /* Render charts after DOM update */
+      if (!singleDay) {
+        setTimeout(function () { renderCharts(data, content); }, 50);
+      }
+
+      /* Fetch operational conversations separately from resolutions by resolution date. */
+      Promise.all([
+        fetchConversationsList(days, selectedInbox, {
+          statuses: ['open', 'pending', 'snoozed'],
+          mode: 'activity'
+        }),
+        fetchConversationsList(days, selectedInbox, {
+          statuses: ['resolved'],
+          mode: 'resolved'
+        })
+      ]).then(function (conversationGroups) {
+        var operationalConversations = conversationGroups[0] || [];
+        var resolvedConversations = conversationGroups[1] || [];
+        var conversations = mergeConversationLists([operationalConversations, resolvedConversations]);
+        var rankingOptions = {
+          range: dateRange(days),
+          expectedResolutions: resolvedCount(data.accountSummary) || 0
+        };
+        var loadingEl = content.querySelector('#eda-conv-loading');
+        if (loadingEl) {
+          var listHtml = buildConversationList(operationalConversations, {
+            excludeResolved: true,
+            emptyMessage: 'Nenhuma conversa aberta, pendente ou adiada neste período'
+          });
+          var wrapper = document.createElement('div');
+          wrapper.innerHTML = listHtml;
+          loadingEl.parentNode.replaceChild(wrapper, loadingEl);
+        }
+
+        var rkEl = content.querySelector('#eda-contact-label-rankings');
+        return fetchConversationMessageData(conversations).then(function (messageData) {
+          applyLocalFirstResponseMetrics(data, conversations, messageData, days);
+          updateAgentRankingCard(content, data);
+          if (rkEl) rkEl.innerHTML = buildContactLabelRankingsHtml(conversations, messageData.counts, rankingOptions);
+        }).catch(function () {
+          updateAgentRankingCard(content, data);
+          if (rkEl) rkEl.innerHTML = buildContactLabelRankingsHtml(conversations, {}, rankingOptions);
+        });
+      }).catch(function () {
+        var loadingEl = content.querySelector('#eda-conv-loading');
+        if (loadingEl) loadingEl.innerHTML = '<div class="eda-empty">Não foi possível carregar conversas do período</div>';
+        var rkEl = content.querySelector('#eda-contact-label-rankings');
+        if (rkEl) rkEl.innerHTML = '<div class="eda-empty">Não foi possível carregar rankings de contatos/etiquetas</div>';
+      });
+
+    }).catch(function (err) {
+      content.innerHTML = '<div class="eda-error">' +
+        '<p>❌ Erro ao carregar dados</p>' +
+        '<p style="font-size:12px;opacity:.7">' + esc(err.message) + '</p>' +
+        '</div>';
+    });
+  }
+
+  /* ── Inject sidebar button ────────────────────────────────────────── */
+  function injectButton() {
+    if (document.getElementById(BUTTON_ID)) return;
+
+    /* Find the secondary sidebar (left nav icons) */
+    var sidebar = document.querySelector('.primary--sidebar') ||
+                  document.querySelector('.sidebar-menu') ||
+                  document.querySelector('[class*="SidebarIcon"]') ||
+                  document.querySelector('aside');
+
+    if (!sidebar) return;
+
+    /* Find the nav container inside the sidebar */
+    var navContainer = sidebar.querySelector('.menu--container') ||
+                       sidebar.querySelector('nav') ||
+                       sidebar;
+
+    var btn = document.createElement('button');
+    btn.id = BUTTON_ID;
+    btn.title = 'Dashboard de Atendimento';
+    btn.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" ' +
+        'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<rect x="3" y="3" width="7" height="7" rx="1"/>' +
+        '<rect x="14" y="3" width="7" height="4" rx="1"/>' +
+        '<rect x="3" y="14" width="7" height="7" rx="1"/>' +
+        '<rect x="14" y="11" width="7" height="10" rx="1"/>' +
+      '</svg>';
+
+    btn.addEventListener('click', function () {
+      renderDashboard(30);
+    });
+
+    navContainer.appendChild(btn);
+  }
+
+  /* ── Initialization ───────────────────────────────────────────────── */
+  function init() {
+    injectButton();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  /* Re-inject on SPA navigation */
+  var lastUrl = location.href;
+  setInterval(function () {
+    var curUrl = location.href;
+    if (curUrl !== lastUrl) {
+      lastUrl = curUrl;
+      /* Update account ID on navigation */
+      var newAccId = getAccountId();
+      if (newAccId) {
+        accountId = newAccId;
+      }
+      /* Remove overlay if navigating away */
+      var overlay = document.getElementById(OVERLAY_ID);
+      if (overlay) overlay.remove();
+
+      /* Re-inject button */
+      setTimeout(injectButton, 500);
+    } else if (!document.getElementById(BUTTON_ID)) {
+      /* Button may have been removed by Vue re-render */
+      injectButton();
+    }
+  }, 2000);
+})();
+</script>

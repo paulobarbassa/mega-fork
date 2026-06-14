@@ -1,0 +1,27 @@
+<script>
+/* ==========================================================================
+   MEGA - LOGO ENLARGE
+   Aumenta o tamanho do logo exibido na seção de apresentação do dashboard.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: o seletor CSS usa src e alt da imagem — ajuste os valores
+   entre aspas (src*="..." e alt="...") para corresponder ao logo da sua
+   instalação. Altere também o valor de height conforme necessário.
+   ========================================================================== */
+(function () {
+  const STYLE_ID = 'logo-enlarge-style';
+  if (document.getElementById(STYLE_ID)) return;
+
+  const style = document.createElement('style');
+  style.id = STYLE_ID;
+  style.textContent = `
+    /* Amplia os logos dentro da seção .max-w-5xl que contém as imagens do EngeCentral */
+    section.max-w-5xl img[src*="engedigital"][alt="EngeCentral"] {
+      height: 4rem !important;   /* de h-12 (3rem) para 4rem — ajuste conforme necessário */
+      max-height: none !important;
+      width: auto !important;
+    }
+  `;
+  document.head.appendChild(style);
+})();
+</script>

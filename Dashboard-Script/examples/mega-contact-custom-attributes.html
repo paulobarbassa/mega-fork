@@ -1,0 +1,460 @@
+<script>
+/* ==========================================================================
+   MEGA - CONTACT CUSTOM ATTRIBUTES
+   Exibe atributos personalizados do contato no painel lateral da conversa.
+   Somente leitura: busca os dados via API quando o Vuex store não os possui
+   e os renderiza abaixo das informações padrão do contato, com cache TTL
+   para minimizar requisições.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração:
+     - ALLOWED_ACCOUNTS: account_ids onde o widget deve aparecer.
+     - CONTACT_ATTRIBUTES: lista de { key, label, icon } com os atributos
+       personalizados a exibir (chave deve corresponder ao identificador do
+       atributo no Mega).
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  const ALLOWED_ACCOUNTS = new Set(['6']);
+  const CONTACT_ATTRIBUTES = [
+    { key: 'empresa', label: 'Empresa', icon: 'i-lucide-building-2' },
+    { key: 'cidade', label: 'Cidade', icon: 'i-lucide-map-pin' },
+    { key: 'uf', label: 'UF', icon: 'i-lucide-map' },
+  ];
+  const SHOW_EMPTY_FIELDS = true;
+  const EMPTY_TEXT = 'Indisponível';
+  const CACHE_TTL_MS = 60000;
+
+  const curAccount = (location.pathname.match(/\/app\/accounts\/(\d+)/) || [])[1];
+  if (!curAccount || !ALLOWED_ACCOUNTS.has(curAccount)) return;
+
+  const STYLE_ID = 'contact-custom-attrs-style';
+  const WIDGET_ID = 'contact-custom-attrs-widget';
+  const QUICK_CONNECT_WIDGET_ID = 'engedesk-qc-widget';
+  if (document.getElementById(STYLE_ID)) return;
+
+  const css = document.createElement('style');
+  css.id = STYLE_ID;
+  css.textContent = `
+    #${WIDGET_ID} {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      width: 100%;
+      padding-top: 8px;
+      margin-top: 2px;
+      border-top: 1px solid rgba(0,0,0,.06);
+      box-sizing: border-box;
+    }
+    .dark #${WIDGET_ID} {
+      border-top-color: rgba(255,255,255,.08);
+    }
+    .cwca-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      min-width: 0;
+      min-height: 20px;
+      color: var(--n-slate-11, var(--s-700, #374151));
+      box-sizing: border-box;
+    }
+    .cwca-icon {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      margin-left: 4px;
+      color: var(--n-slate-10, var(--s-500, #6b7280));
+      font-size: 14px;
+      line-height: 1;
+    }
+    .cwca-body {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    .cwca-label {
+      flex: 0 0 auto;
+      color: var(--n-slate-10, var(--s-500, #6b7280));
+      font-size: .75rem;
+      font-weight: 600;
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+    .cwca-value {
+      min-width: 0;
+      flex: 1 1 auto;
+      color: var(--n-slate-11, var(--s-700, #374151));
+      font-size: .875rem;
+      line-height: 1.35;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cwca-row.is-empty .cwca-value {
+      color: var(--n-slate-9, var(--s-400, #9ca3af));
+      font-style: italic;
+    }
+    .dark .cwca-row {
+      color: var(--n-slate-11, var(--s-200, #e5e7eb));
+    }
+    .dark .cwca-icon,
+    .dark .cwca-label {
+      color: var(--n-slate-10, var(--s-300, #9ca3af));
+    }
+    .dark .cwca-value {
+      color: var(--n-slate-11, var(--s-100, #f3f4f6));
+    }
+    .dark .cwca-row.is-empty .cwca-value {
+      color: var(--n-slate-9, var(--s-400, #9ca3af));
+    }
+  `;
+  document.head.appendChild(css);
+
+  function parseUrl() {
+    const m = location.pathname.match(
+      /\/app\/accounts\/(\d+)\/conversations\/(\d+)/
+    );
+    return m ? { accountId: m[1], convId: m[2] } : null;
+  }
+
+  function isAllowedAccount(accountId) {
+    return accountId && ALLOWED_ACCOUNTS.has(accountId);
+  }
+
+  function getStore() {
+    try {
+      return document.getElementById('app')
+        .__vue_app__.config.globalProperties.$store;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getToken() {
+    if (typeof window.authToken === 'string' && window.authToken) {
+      return window.authToken;
+    }
+    try {
+      const store = getStore();
+      if (!store) return null;
+      const user =
+        store.getters['auth/getCurrentUser'] ||
+        store.getters.getCurrentUser;
+      return (user && user.access_token) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function emptyValues() {
+    const values = {};
+    CONTACT_ATTRIBUTES.forEach(function (attr) {
+      values[attr.key] = '';
+    });
+    return values;
+  }
+
+  function normalizeValue(value) {
+    if (value == null) return '';
+    if (Array.isArray(value)) {
+      return value.map(normalizeValue).filter(Boolean).join(', ');
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value);
+      } catch (_) {
+        return '';
+      }
+    }
+    return String(value).trim();
+  }
+
+  function extractValues(customAttributes) {
+    const values = emptyValues();
+    const attrs = customAttributes || {};
+
+    CONTACT_ATTRIBUTES.forEach(function (attr) {
+      if (Object.prototype.hasOwnProperty.call(attrs, attr.key)) {
+        values[attr.key] = normalizeValue(attrs[attr.key]);
+      }
+    });
+
+    return values;
+  }
+
+  function getSelectedChat(store) {
+    var chat =
+      store.getters.getSelectedChat ||
+      store.getters['getSelectedChat'];
+    if (typeof chat === 'function') {
+      chat = chat();
+    }
+    return chat || null;
+  }
+
+  function readFromStore() {
+    try {
+      const store = getStore();
+      if (!store) return { ok: false, contactId: null, values: emptyValues() };
+
+      const chat = getSelectedChat(store);
+      if (!chat) return { ok: false, contactId: null, values: emptyValues() };
+
+      var sender = chat.meta && chat.meta.sender;
+      var contactId = sender && sender.id;
+      var customAttributes = sender && sender.custom_attributes;
+
+      if (contactId) {
+        try {
+          var getContact = store.getters['contacts/getContact'];
+          var contact = getContact && getContact(contactId);
+          if (contact && contact.custom_attributes) {
+            customAttributes = contact.custom_attributes;
+          }
+        } catch (_) {}
+      }
+
+      return {
+        ok: Boolean(contactId || customAttributes),
+        contactId: contactId || null,
+        values: extractValues(customAttributes),
+      };
+    } catch (_) {
+      return { ok: false, contactId: null, values: emptyValues() };
+    }
+  }
+
+  const attrCache = {};
+
+  function getCached(key) {
+    var cached = attrCache[key];
+    if (!cached) return null;
+    if (Date.now() - cached.ts > CACHE_TTL_MS) {
+      delete attrCache[key];
+      return null;
+    }
+    return cached.data;
+  }
+
+  function setCached(key, data) {
+    attrCache[key] = { ts: Date.now(), data: data };
+  }
+
+  async function readFromApi(accountId, convId, contactId) {
+    const convCacheKey = accountId + ':conv:' + convId;
+    const contactCacheKey = contactId ? accountId + ':contact:' + contactId : null;
+    var cached = contactCacheKey ? getCached(contactCacheKey) : getCached(convCacheKey);
+    if (cached) return cached;
+
+    const token = getToken();
+    if (!token) return { ok: false, contactId: contactId || null, values: emptyValues() };
+
+    try {
+      var resolvedContactId = contactId;
+
+      if (!resolvedContactId) {
+        var r1 = await fetch(
+          '/api/v1/accounts/' + accountId + '/conversations/' + convId,
+          { headers: { api_access_token: token } }
+        );
+        if (!r1.ok) {
+          return { ok: false, contactId: null, values: emptyValues() };
+        }
+        var conv = await r1.json();
+        resolvedContactId =
+          conv && conv.meta && conv.meta.sender && conv.meta.sender.id;
+      }
+
+      if (!resolvedContactId) {
+        return { ok: false, contactId: null, values: emptyValues() };
+      }
+
+      var r2 = await fetch(
+        '/api/v1/accounts/' + accountId + '/contacts/' + resolvedContactId,
+        { headers: { api_access_token: token } }
+      );
+      if (!r2.ok) {
+        return { ok: false, contactId: resolvedContactId, values: emptyValues() };
+      }
+
+      var contact = await r2.json();
+      var result = {
+        ok: true,
+        contactId: resolvedContactId,
+        values: extractValues(contact && contact.custom_attributes),
+      };
+
+      setCached(accountId + ':contact:' + resolvedContactId, result);
+      setCached(convCacheKey, result);
+      return result;
+    } catch (_) {
+      return { ok: false, contactId: contactId || null, values: emptyValues() };
+    }
+  }
+
+  async function fetchContactAttributes(accountId, convId) {
+    var fromStore = readFromStore();
+    var fromApi = await readFromApi(accountId, convId, fromStore.contactId);
+
+    if (fromApi.ok) {
+      return fromApi.values;
+    }
+    return fromStore.values;
+  }
+
+  let activeConvId = null;
+  let busy = false;
+
+  function removeWidget() {
+    const el = document.getElementById(WIDGET_ID);
+    if (el) el.remove();
+  }
+
+  function buildRow(attr, rawValue) {
+    const value = normalizeValue(rawValue);
+    const row = document.createElement('div');
+    row.className = 'cwca-row';
+    if (!value) row.classList.add('is-empty');
+
+    const icon = document.createElement('span');
+    icon.className = 'cwca-icon ' + attr.icon;
+    icon.title = attr.label;
+
+    const body = document.createElement('span');
+    body.className = 'cwca-body';
+
+    const label = document.createElement('span');
+    label.className = 'cwca-label';
+    label.textContent = attr.label + ':';
+
+    const text = document.createElement('span');
+    text.className = 'cwca-value';
+    text.textContent = value || EMPTY_TEXT;
+    text.title = attr.label + ': ' + (value || EMPTY_TEXT);
+
+    body.appendChild(label);
+    body.appendChild(text);
+    row.appendChild(icon);
+    row.appendChild(body);
+    return row;
+  }
+
+  function buildWidget(values) {
+    const widget = document.createElement('div');
+    widget.id = WIDGET_ID;
+
+    CONTACT_ATTRIBUTES.forEach(function (attr) {
+      var value = values && values[attr.key];
+      if (!SHOW_EMPTY_FIELDS && !normalizeValue(value)) return;
+      widget.appendChild(buildRow(attr, value));
+    });
+
+    return widget.childNodes.length ? widget : null;
+  }
+
+  function findContactPanel() {
+    return (
+      document.querySelector('.conversation-sidebar [channel-type]') ||
+      document.querySelector('[channel-type]')
+    );
+  }
+
+  function appendWidget(panel, widget) {
+    const inner = panel.querySelector(':scope > div') || panel;
+    const quickConnect = document.getElementById(QUICK_CONNECT_WIDGET_ID);
+
+    if (quickConnect && quickConnect.parentNode === inner) {
+      inner.insertBefore(widget, quickConnect);
+      return;
+    }
+    inner.appendChild(widget);
+  }
+
+  async function inject() {
+    const ctx = parseUrl();
+    if (!ctx || !isAllowedAccount(ctx.accountId)) {
+      removeWidget();
+      activeConvId = null;
+      return;
+    }
+
+    if (ctx.convId === activeConvId && document.getElementById(WIDGET_ID)) {
+      return;
+    }
+
+    const panel = findContactPanel();
+    if (!panel) return;
+
+    if (ctx.convId !== activeConvId) {
+      removeWidget();
+      activeConvId = ctx.convId;
+    }
+
+    if (document.getElementById(WIDGET_ID)) return;
+    if (busy) return;
+    busy = true;
+
+    try {
+      const values = await fetchContactAttributes(ctx.accountId, ctx.convId);
+
+      const ctx2 = parseUrl();
+      if (!ctx2 || ctx2.convId !== ctx.convId) return;
+
+      const panel2 = findContactPanel();
+      if (!panel2 || document.getElementById(WIDGET_ID)) return;
+
+      const widget = buildWidget(values);
+      if (!widget) return;
+
+      appendWidget(panel2, widget);
+    } finally {
+      busy = false;
+    }
+  }
+
+  let debounce = null;
+  const observer = new MutationObserver(function () {
+    if (debounce) return;
+    debounce = setTimeout(function () {
+      debounce = null;
+      if (
+        !document.getElementById(WIDGET_ID) ||
+        (parseUrl() && parseUrl().convId !== activeConvId)
+      ) {
+        inject();
+      }
+    }, 400);
+  });
+
+  function start() {
+    observer.observe(document.body, { childList: true, subtree: true });
+    inject();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+
+  let lastHref = location.href;
+  setInterval(function () {
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      removeWidget();
+      activeConvId = null;
+      var acct = (location.pathname.match(/\/app\/accounts\/(\d+)/) || [])[1];
+      if (isAllowedAccount(acct)) {
+        setTimeout(inject, 600);
+      }
+    }
+  }, 1000);
+})();
+</script>

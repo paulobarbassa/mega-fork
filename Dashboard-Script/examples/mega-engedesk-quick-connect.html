@@ -1,0 +1,571 @@
+<script>
+/* ==========================================================================
+   MEGA - ENGEDESK QUICK CONNECT
+   Adiciona campo editável com o ID EngeDesk do contato e botão de conexão
+   rápida no painel lateral da conversa. O campo é pré-preenchido com o
+   atributo personalizado "engedesk_id" do contato, mas o técnico pode
+   alterar o valor antes de conectar. Também transforma links
+   engedeskconsoletech:// (em notas e mensagens) em botões clicáveis.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Requer: EngeDesk (RustDesk com handler customizado engedeskconsoletech://).
+   Configuração: ajuste ALLOWED_ACCOUNTS com os account_ids autorizados.
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /* Contas autorizadas a usar este widget (account_id da URL) */
+  const ALLOWED_ACCOUNTS = new Set(['6']);
+
+  const curAccount = (location.pathname.match(/\/app\/accounts\/(\d+)/) || [])[1];
+  if (!curAccount || !ALLOWED_ACCOUNTS.has(curAccount)) return;
+
+  const STYLE_ID  = 'engedesk-qc-style';
+  const WIDGET_ID = 'engedesk-qc-widget';
+  const ATTR_DONE = 'data-engedesk-processed';
+  if (document.getElementById(STYLE_ID)) return;
+
+  /* ── CSS ──────────────────────────────────────────────────────────── */
+  const css = document.createElement('style');
+  css.id = STYLE_ID;
+  css.textContent = `
+    #${WIDGET_ID} {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+      padding-top: 8px;
+      margin-top: 2px;
+      border-top: 1px solid rgba(0,0,0,.06);
+    }
+    .dark #${WIDGET_ID} {
+      border-top-color: rgba(255,255,255,.08);
+    }
+    .engedesk-qc-icon {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 28px;
+      color: var(--s-600, #6b7280);
+    }
+    .dark .engedesk-qc-icon {
+      color: var(--s-300, #9ca3af);
+    }
+    .engedesk-qc-input {
+      flex: 1;
+      min-width: 0;
+      height: 28px;
+      padding: 2px 8px;
+      border: 1px solid var(--s-200, #e5e7eb);
+      border-radius: 6px;
+      background: var(--white, #fff);
+      color: var(--s-800, #1f2937);
+      font-size: 0.8rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color .15s, box-shadow .15s;
+      box-sizing: border-box;
+    }
+    .engedesk-qc-input::placeholder {
+      color: var(--s-400, #9ca3af);
+    }
+    .engedesk-qc-input:focus {
+      border-color: #14919b;
+      box-shadow: 0 0 0 2px rgba(20,145,155,.15);
+    }
+    .dark .engedesk-qc-input {
+      background: var(--s-800, #1f2937);
+      border-color: var(--s-600, #4b5563);
+      color: var(--s-100, #f3f4f6);
+    }
+    .dark .engedesk-qc-input:focus {
+      border-color: #00bfa5;
+      box-shadow: 0 0 0 2px rgba(0,191,165,.2);
+    }
+    .engedesk-qc-btn {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      height: 28px;
+      padding: 0 10px;
+      border: none;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #0d7377, #14919b);
+      color: #fff;
+      font-size: .75rem;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background .2s, box-shadow .2s, transform .1s;
+      box-shadow: 0 1px 4px rgba(13,115,119,.3);
+      white-space: nowrap;
+      text-decoration: none;
+      line-height: 1;
+      box-sizing: border-box;
+    }
+    .engedesk-qc-btn:hover {
+      background: linear-gradient(135deg, #0a5c5f, #0d7377);
+      box-shadow: 0 2px 8px rgba(13,115,119,.45);
+      transform: translateY(-1px);
+    }
+    .engedesk-qc-btn:active {
+      transform: translateY(0);
+      box-shadow: 0 1px 3px rgba(13,115,119,.3);
+    }
+    .engedesk-qc-btn.is-disabled {
+      opacity: .45;
+      pointer-events: none;
+    }
+    .dark .engedesk-qc-btn {
+      background: linear-gradient(135deg, #00bfa5, #26d9c4);
+      color: #0a0a0a;
+      box-shadow: 0 1px 6px rgba(0,191,165,.35);
+    }
+    .dark .engedesk-qc-btn:hover {
+      background: linear-gradient(135deg, #1de9b6, #64ffda);
+      box-shadow: 0 2px 10px rgba(0,191,165,.5);
+    }
+    .engedesk-connect-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #0d7377, #14919b);
+      color: #fff;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background 0.2s, box-shadow 0.2s, transform 0.1s;
+      box-shadow: 0 2px 6px rgba(13, 115, 119, 0.3);
+      line-height: 1.4;
+    }
+    .engedesk-connect-btn:hover {
+      background: linear-gradient(135deg, #0a5c5f, #0d7377);
+      box-shadow: 0 4px 12px rgba(13, 115, 119, 0.45);
+      transform: translateY(-1px);
+    }
+    .engedesk-connect-btn:active {
+      transform: translateY(0);
+      box-shadow: 0 1px 4px rgba(13, 115, 119, 0.3);
+    }
+    .engedesk-connect-btn svg {
+      flex-shrink: 0;
+    }
+    .dark .engedesk-connect-btn {
+      background: linear-gradient(135deg, #00bfa5, #26d9c4);
+      color: #0a0a0a;
+      box-shadow: 0 2px 8px rgba(0, 191, 165, 0.35);
+    }
+    .dark .engedesk-connect-btn:hover {
+      background: linear-gradient(135deg, #1de9b6, #64ffda);
+      color: #0a0a0a;
+      box-shadow: 0 4px 14px rgba(0, 191, 165, 0.5);
+    }
+  `;
+  document.head.appendChild(css);
+
+  /* ── SVG ──────────────────────────────────────────────────────────── */
+  const ICON_MONITOR =
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+    'stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/>' +
+    '<line x1="8" y1="21" x2="16" y2="21"/>' +
+    '<line x1="12" y1="17" x2="12" y2="21"/></svg>';
+
+  const ICON_CONNECT =
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" ' +
+    'stroke-linejoin="round"><polyline points="13 17 18 12 13 7"/>' +
+    '<polyline points="6 17 11 12 6 7"/></svg>';
+
+  const ICON_REMOTE =
+    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+    'stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>' +
+    '<line x1="8" y1="21" x2="16" y2="21"/>' +
+    '<line x1="12" y1="17" x2="12" y2="21"/></svg>';
+
+  const ENGEDESK_RE = /engedeskconsoletech:\/\/(?:(?!engedeskconsoletech:\/\/)[^\r\n<])*/gi;
+
+  /* ── Helpers ─────────────────────────────────────────────────────── */
+  function parseUrl() {
+    const m = location.pathname.match(
+      /\/app\/accounts\/(\d+)\/conversations\/(\d+)/
+    );
+    return m ? { accountId: m[1], convId: m[2] } : null;
+  }
+
+  function isAllowedAccount(accountId) {
+    return accountId && ALLOWED_ACCOUNTS.has(accountId);
+  }
+
+  function getStore() {
+    try {
+      return document.getElementById('app')
+        .__vue_app__.config.globalProperties.$store;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getToken() {
+    if (typeof window.authToken === 'string' && window.authToken) {
+      return window.authToken;
+    }
+    try {
+      const store = getStore();
+      if (!store) return null;
+      const user =
+        store.getters['auth/getCurrentUser'] ||
+        store.getters.getCurrentUser;
+      return (user && user.access_token) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /* ── Estratégia 1: Vuex store (sem rede) ─────────────────────────── */
+  function readFromStore() {
+    try {
+      const store = getStore();
+      if (!store) return '';
+
+      /* Conversa selecionada */
+      var chat =
+        (store.getters.getSelectedChat) ||
+        (store.getters['getSelectedChat']);
+      if (!chat) return '';
+
+      var contactId =
+        chat.meta && chat.meta.sender && chat.meta.sender.id;
+
+      /* Tentar obter contato completo do módulo contacts */
+      if (contactId) {
+        try {
+          var contact = store.getters['contacts/getContact'](contactId);
+          if (contact && contact.custom_attributes &&
+              contact.custom_attributes.engedesk_id != null) {
+            return String(contact.custom_attributes.engedesk_id);
+          }
+        } catch (_) {}
+      }
+
+      /* Fallback: custom_attributes direto no sender */
+      var sender = chat.meta && chat.meta.sender;
+      if (sender && sender.custom_attributes &&
+          sender.custom_attributes.engedesk_id != null) {
+        return String(sender.custom_attributes.engedesk_id);
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  /* ── Estratégia 2: Ler do DOM (atributos de contato visíveis) ──── */
+  function readFromDom() {
+    try {
+      /* Procura entre os atributos do contato renderizados na sidebar */
+      var sections = document.querySelectorAll(
+        '.conversation-sidebar .drag-handle, ' +
+        '.custom-attributes .drag-handle, ' +
+        '[class*="custom-attribute"]'
+      );
+      for (var i = 0; i < sections.length; i++) {
+        var el = sections[i];
+        var label = el.querySelector('span');
+        if (!label) continue;
+        var text = (label.textContent || '').trim().toLowerCase();
+        if (text.indexOf('engedesk_id') !== 0) continue;
+        /* Encontrou o atributo; extrair o valor */
+        var pVal = el.querySelector('p');
+        if (pVal) {
+          var v = (pVal.textContent || '').trim();
+          if (v && v !== '---') return v;
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  /* ── Estratégia 3: API (fallback com rede) ───────────────────────── */
+  const idCache = {};
+
+  async function readFromApi(accountId, convId) {
+    if (convId in idCache) return idCache[convId];
+
+    const token = getToken();
+    if (!token) return '';
+
+    try {
+      var r1 = await fetch(
+        '/api/v1/accounts/' + accountId + '/conversations/' + convId,
+        { headers: { api_access_token: token } }
+      );
+      if (!r1.ok) return '';
+      var conv = await r1.json();
+      var contactId =
+        conv && conv.meta && conv.meta.sender && conv.meta.sender.id;
+      if (!contactId) return '';
+
+      var r2 = await fetch(
+        '/api/v1/accounts/' + accountId + '/contacts/' + contactId,
+        { headers: { api_access_token: token } }
+      );
+      if (!r2.ok) return '';
+      var contact = await r2.json();
+      var val =
+        (contact &&
+          contact.custom_attributes &&
+          contact.custom_attributes.engedesk_id) ||
+        '';
+      idCache[convId] = sanitizeId(val);
+      return idCache[convId];
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /* Somente dígitos no ID para segurança */
+  function sanitizeId(v) {
+    return String(v == null ? '' : v).replace(/\D/g, '');
+  }
+
+  function buildConnectButton(id) {
+    const btn = document.createElement('a');
+    btn.href = 'engedeskconsoletech://' + id;
+    btn.className = 'engedesk-connect-btn';
+    btn.title = 'Conectar ao EngeDesk: ' + id;
+    btn.innerHTML = ICON_REMOTE + ' Conectar — ' + id;
+    return btn;
+  }
+
+  function processElement(el) {
+    if (el.hasAttribute(ATTR_DONE)) return;
+
+    const prose = el.querySelector('.prose');
+    if (!prose) return;
+
+    const textContent = prose.textContent || '';
+    const matches = textContent.match(ENGEDESK_RE);
+    if (!matches) return;
+
+    el.setAttribute(ATTR_DONE, '1');
+
+    matches.forEach(function (rawMatch) {
+      const matchedText = rawMatch.trimEnd();
+      const cleanId = sanitizeId(matchedText.replace(/^engedeskconsoletech:\/\//i, ''));
+      if (!cleanId) return;
+
+      const walker = document.createTreeWalker(prose, NodeFilter.SHOW_TEXT, null, false);
+      let node;
+      while ((node = walker.nextNode())) {
+        const idx = node.textContent.indexOf(matchedText);
+        if (idx === -1) continue;
+
+        const btn = buildConnectButton(cleanId);
+        const before = node.textContent.substring(0, idx);
+        const after = node.textContent.substring(idx + matchedText.length);
+        const parent = node.parentNode;
+
+        parent.insertBefore(document.createTextNode(before), node);
+        parent.insertBefore(btn, node);
+        parent.insertBefore(document.createTextNode(after), node);
+        parent.removeChild(node);
+        break;
+      }
+    });
+  }
+
+  function scanAll() {
+    const acct = (location.pathname.match(/\/app\/accounts\/(\d+)/) || [])[1];
+    if (!isAllowedAccount(acct)) return;
+
+    document.querySelectorAll(
+      '.conversation-panel .activity-wrap:not([' + ATTR_DONE + ']), ' +
+      '.conversation-panel .right-bubble:not([' + ATTR_DONE + ']), ' +
+      '.conversation-panel .left-bubble:not([' + ATTR_DONE + '])'
+    ).forEach(processElement);
+  }
+
+  /* ── Orquestrador: tenta store → DOM → API ───────────────────────── */
+  async function fetchEngedeskId(accountId, convId) {
+    /* 1. Vuex store (instantâneo) */
+    var val = sanitizeId(readFromStore());
+    if (val) return val;
+
+    /* 2. DOM scraping (instantâneo) */
+    val = sanitizeId(readFromDom());
+    if (val) return val;
+
+    /* 3. API (rede) */
+    val = sanitizeId(await readFromApi(accountId, convId));
+    return val;
+  }
+
+  /* ── Widget ──────────────────────────────────────────────────────── */
+  let activeConvId = null;
+  let busy = false;
+
+  function removeWidget() {
+    const el = document.getElementById(WIDGET_ID);
+    if (el) el.remove();
+  }
+
+  function buildWidget(value) {
+    const row = document.createElement('div');
+    row.id = WIDGET_ID;
+
+    const icon = document.createElement('span');
+    icon.className = 'engedesk-qc-icon';
+    icon.innerHTML = ICON_MONITOR;
+    icon.title = 'EngeDesk ID';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'numeric';
+    input.autocomplete = 'off';
+    input.className = 'engedesk-qc-input';
+    input.placeholder = 'EngeDesk ID';
+    input.value = sanitizeId(value);
+    input.title = 'ID EngeDesk — editável';
+
+    const btn = document.createElement('a');
+    btn.className = 'engedesk-qc-btn';
+    btn.innerHTML = ICON_CONNECT + ' Conectar';
+    btn.title = 'Iniciar conexão remota via EngeDesk';
+
+    function sync() {
+      const id = sanitizeId(input.value);
+      if (input.value !== id) input.value = id;
+      if (id) {
+        btn.href = 'engedeskconsoletech://' + id;
+        btn.classList.remove('is-disabled');
+      } else {
+        btn.removeAttribute('href');
+        btn.classList.add('is-disabled');
+      }
+    }
+
+    input.addEventListener('input', sync);
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (btn.href) btn.click();
+      }
+    });
+    sync();
+
+    row.appendChild(icon);
+    row.appendChild(input);
+    row.appendChild(btn);
+    return row;
+  }
+
+  /* ── Injeção ─────────────────────────────────────────────────────── */
+  async function inject() {
+    const ctx = parseUrl();
+    if (!ctx || !isAllowedAccount(ctx.accountId)) {
+      removeWidget();
+      activeConvId = null;
+      return;
+    }
+
+    /* Widget já presente para esta conversa */
+    if (ctx.convId === activeConvId && document.getElementById(WIDGET_ID)) {
+      return;
+    }
+
+    /* Painel do contato presente no DOM? */
+    const panel =
+      document.querySelector('.conversation-sidebar [channel-type]') ||
+      document.querySelector('[channel-type]');
+    if (!panel) return;
+
+    /* Nova conversa — limpar */
+    if (ctx.convId !== activeConvId) {
+      removeWidget();
+      activeConvId = ctx.convId;
+    }
+
+    if (document.getElementById(WIDGET_ID)) return;
+    if (busy) return;
+    busy = true;
+
+    try {
+      const val = await fetchEngedeskId(ctx.accountId, ctx.convId);
+
+      /* Verificar se ainda estamos na mesma conversa após o fetch */
+      const ctx2 = parseUrl();
+      if (!ctx2 || ctx2.convId !== ctx.convId) return;
+
+      /* Painel pode ter sido re-renderizado pelo Vue */
+      const panel2 =
+        document.querySelector('.conversation-sidebar [channel-type]') ||
+        document.querySelector('[channel-type]');
+      if (!panel2 || document.getElementById(WIDGET_ID)) return;
+
+      const widget = buildWidget(val);
+
+      /* Inserir no final do container flex-col interno (abaixo do contato) */
+      const inner = panel2.querySelector(':scope > div');
+      if (inner) {
+        inner.appendChild(widget);
+      } else {
+        panel2.appendChild(widget);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  /* ── Observers & SPA navigation ──────────────────────────────────── */
+  let debounce = null;
+  const observer = new MutationObserver(function () {
+    if (debounce) return;
+    debounce = setTimeout(function () {
+      debounce = null;
+      scanAll();
+      /* Re-injetar se o widget sumiu (Vue re-render) */
+      if (
+        !document.getElementById(WIDGET_ID) ||
+        (parseUrl() && parseUrl().convId !== activeConvId)
+      ) {
+        inject();
+      }
+    }, 400);
+  });
+
+  function start() {
+    observer.observe(document.body, { childList: true, subtree: true });
+    scanAll();
+    inject();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+
+  /* Detecta navegação SPA (troca de conversa) */
+  let lastHref = location.href;
+  setInterval(function () {
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      removeWidget();
+      activeConvId = null;
+      setTimeout(scanAll, 500);
+      var acct = (location.pathname.match(/\/app\/accounts\/(\d+)/) || [])[1];
+      if (isAllowedAccount(acct)) {
+        setTimeout(inject, 600);
+      }
+    }
+  }, 1000);
+})();
+</script>

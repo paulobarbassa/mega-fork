@@ -1,0 +1,347 @@
+<script>
+/* ==========================================================================
+   MEGA - GROUP CONTACT COLORS
+   Diferencia visualmente os participantes em conversas de grupo do WhatsApp.
+   Atribui uma cor consistente a cada contato (derivada do nome via hash):
+   borda colorida no balão de mensagem e nome destacado com essa cor.
+   A cor persiste durante toda a sessão da conversa.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: personalize o array PALETTE com as cores desejadas.
+   ========================================================================== */
+(function () {
+  const STYLE_ID  = 'group-contacts-style';
+  const ATTR_DONE = 'data-group-contact-colored';
+  if (document.getElementById(STYLE_ID)) return;
+
+  /* ── Paleta de cores para contatos (acessível em light & dark) ────── */
+  const PALETTE = [
+    '#E91E63', // rosa
+    '#9C27B0', // roxo
+    '#3F51B5', // índigo
+    '#0097A7', // ciano escuro
+    '#00897B', // teal
+    '#2E7D32', // verde
+    '#F57F17', // âmbar escuro
+    '#E65100', // laranja escuro
+    '#5D4037', // marrom
+    '#1565C0', // azul
+    '#6A1B9A', // roxo escuro
+    '#AD1457', // pink escuro
+    '#00695C', // teal escuro
+    '#EF6C00', // laranja
+    '#283593', // índigo escuro
+    '#C62828', // vermelho escuro
+  ];
+
+  /* ── Hash simples de string → índice de cor ──────────────────────── */
+  function hashColor(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+    }
+    return PALETTE[Math.abs(hash) % PALETTE.length];
+  }
+
+  /* ── CSS base ────────────────────────────────────────────────────── */
+  const style = document.createElement('style');
+  style.id = STYLE_ID;
+  style.textContent = `
+    /* Balão com borda de contato */
+    .left-bubble[data-contact-color] {
+      border-left: 3px solid var(--contact-color) !important;
+    }
+    /* Nome do contato destacado */
+    .left-bubble[data-contact-color] .group-contact-name {
+      color: var(--contact-color);
+      font-weight: 700;
+      font-size: 0.8rem;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 2px;
+      line-height: 1.2;
+    }
+    /* Avatar mini do contato */
+    .group-contact-avatar {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      min-width: 22px;
+      border-radius: 50%;
+      background: var(--contact-color);
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      flex-shrink: 0;
+    }
+    /* Número de telefone menor e discreto */
+    .group-contact-phone {
+      font-size: 0.7rem;
+      font-weight: 400;
+      opacity: 0.55;
+      margin-left: 2px;
+    }
+
+    /* Dark mode — bordas um pouco mais brilhantes */
+    .dark .left-bubble[data-contact-color] {
+      border-left-color: var(--contact-color) !important;
+    }
+  `;
+  document.head.appendChild(style);
+
+  /* ── Regex para capturar "(+XXXXXXXXXXX) NOME": ─────────────────── */
+  const CONTACT_RE = /^\((\+\d+)\)\s+(.+?)(?::)?$/;
+  const CONTACT_MARKDOWN_RE = /^\s*\*\*\((\+\d+)\)\s+(.+?)\*\*:?\s*/;
+  const INITIAL_CHAR_RE = /[\p{L}\p{N}]/u;
+
+  /* ── Extrai iniciais para o avatar ───────────────────────────────── */
+  function initials(name) {
+    const parts = name.trim().split(/\s+/);
+    const chars = [];
+
+    for (const part of parts) {
+      const char = Array.from(part).find(function (value) {
+        return INITIAL_CHAR_RE.test(value);
+      });
+      if (char) chars.push(char);
+    }
+
+    if (!chars.length) return '?';
+    if (chars.length === 1) return chars[0].toUpperCase();
+    return (chars[0] + chars[chars.length - 1]).toUpperCase();
+  }
+
+  function isQuotePreview(node) {
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    if (!element) return false;
+
+    const prose = element.closest('.prose.prose-bubble');
+    if (!prose) return false;
+    if (prose.classList.contains('line-clamp-2')) return true;
+
+    const clickableQuote = prose.closest('.cursor-pointer');
+    return Boolean(clickableQuote && clickableQuote.closest('.left-bubble'));
+  }
+
+  function isFirstContentNode(parentP, targetNode) {
+    let node = parentP.firstChild;
+    while (node && node !== targetNode) {
+      if (node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '') {
+        node = node.nextSibling;
+        continue;
+      }
+      return false;
+    }
+    return node === targetNode;
+  }
+
+  function findContactEntries(bubble) {
+    const entries = [];
+    const strongEls = bubble.querySelectorAll('.prose.prose-bubble strong');
+    for (const strongEl of strongEls) {
+      if (strongEl.closest('.group-contact-name')) continue;
+
+      const parentP = strongEl.closest('p');
+      if (!parentP || !isFirstContentNode(parentP, strongEl)) continue;
+
+      const match = strongEl.textContent.trim().match(CONTACT_RE);
+      if (!match) continue;
+
+      entries.push({
+        strongEl: strongEl,
+        parentP: parentP,
+        phone: match[1],
+        name: match[2].trim(),
+        isQuote: isQuotePreview(strongEl),
+      });
+    }
+
+    const paragraphs = bubble.querySelectorAll('.prose.prose-bubble p');
+    for (const parentP of paragraphs) {
+      let node = parentP.firstChild;
+      while (node && node.nodeType === Node.TEXT_NODE && node.textContent.trim() === '') {
+        node = node.nextSibling;
+      }
+      if (!node || node.nodeType !== Node.TEXT_NODE) continue;
+
+      const match = node.textContent.match(CONTACT_MARKDOWN_RE);
+      if (!match || !isFirstContentNode(parentP, node)) continue;
+
+      entries.push({
+        textNode: node,
+        parentP: parentP,
+        phone: match[1],
+        name: match[2].trim(),
+        isQuote: isQuotePreview(node),
+      });
+    }
+
+    return entries;
+  }
+
+  function stripLeadingSeparator(parentP) {
+    while (
+      parentP.firstChild &&
+      parentP.firstChild.nodeType === Node.TEXT_NODE &&
+      parentP.firstChild.textContent.trim() === ''
+    ) {
+      parentP.firstChild.remove();
+    }
+
+    const firstNode = parentP.firstChild;
+    if (firstNode && firstNode.nodeType === Node.TEXT_NODE) {
+      firstNode.textContent = firstNode.textContent.replace(/^:\s*/, '');
+      if (firstNode.textContent === '') firstNode.remove();
+    }
+  }
+
+  function buildContactHeader(name, phone, color) {
+    const nameDiv = document.createElement('div');
+    nameDiv.className = 'group-contact-name';
+    nameDiv.style.setProperty('--contact-color', color);
+
+    const avatar = document.createElement('span');
+    avatar.className = 'group-contact-avatar';
+    avatar.style.setProperty('--contact-color', color);
+    avatar.textContent = initials(name);
+
+    const label = document.createElement('span');
+    label.textContent = name;
+
+    const phoneSpan = document.createElement('span');
+    phoneSpan.className = 'group-contact-phone';
+    phoneSpan.textContent = phone;
+
+    label.appendChild(phoneSpan);
+    nameDiv.appendChild(avatar);
+    nameDiv.appendChild(label);
+    return nameDiv;
+  }
+
+  function getEntryNode(entry) {
+    return entry.strongEl || entry.textNode || entry.parentP;
+  }
+
+  function getTopLevelChild(parent, node) {
+    let child = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    while (child && child.parentNode !== parent) {
+      child = child.parentElement;
+    }
+    return child && child.parentNode === parent ? child : null;
+  }
+
+  function isBefore(firstNode, secondNode) {
+    return Boolean(firstNode.compareDocumentPosition(secondNode) & Node.DOCUMENT_POSITION_FOLLOWING);
+  }
+
+  function findFirstContactBlock(bubble, contacts) {
+    let firstBlock = null;
+
+    for (const contact of contacts) {
+      const block = getTopLevelChild(bubble, getEntryNode(contact)) || contact.parentP;
+      if (!firstBlock || isBefore(block, firstBlock)) firstBlock = block;
+    }
+
+    return firstBlock;
+  }
+
+  function hasQuoteBeforeContact(contacts, contact) {
+    const contactNode = getEntryNode(contact);
+
+    return contacts.some(function (candidate) {
+      return candidate.isQuote && candidate !== contact && isBefore(getEntryNode(candidate), contactNode);
+    });
+  }
+
+  function formatContactEntry(entry, insertBeforeNode) {
+    const color = hashColor(entry.name);
+    const nameDiv = buildContactHeader(entry.name, entry.phone, color);
+
+    if (entry.strongEl) {
+      entry.strongEl.remove();
+      stripLeadingSeparator(entry.parentP);
+    } else if (entry.textNode) {
+      entry.textNode.textContent = entry.textNode.textContent.replace(CONTACT_MARKDOWN_RE, '');
+      if (entry.textNode.textContent === '') entry.textNode.remove();
+    }
+
+    if (insertBeforeNode && insertBeforeNode.parentNode) {
+      insertBeforeNode.parentNode.insertBefore(nameDiv, insertBeforeNode);
+    } else {
+      entry.parentP.parentNode.insertBefore(nameDiv, entry.parentP);
+    }
+  }
+
+  /* ── Processa um balão de mensagem ───────────────────────────────── */
+  function processBubble(bubble) {
+    // Só processa left-bubbles (mensagens recebidas)
+    if (!bubble.classList.contains('left-bubble')) return;
+
+    const contacts = findContactEntries(bubble);
+    if (!contacts.length) return;
+
+    const mainContact = contacts.find(function (contact) {
+      return !contact.isQuote;
+    }) || contacts[0];
+    const color = hashColor(mainContact.name);
+    const mainInsertBefore = hasQuoteBeforeContact(contacts, mainContact)
+      ? findFirstContactBlock(bubble, contacts)
+      : null;
+
+    contacts.forEach(function (contact) {
+      formatContactEntry(contact, contact === mainContact ? mainInsertBefore : null);
+    });
+
+    // Marca como processado
+    bubble.setAttribute(ATTR_DONE, '1');
+    bubble.setAttribute('data-contact-color', mainContact.name);
+    bubble.style.setProperty('--contact-color', color);
+  }
+
+  /* ── Escaneia todas as bolhas visíveis ───────────────────────────── */
+  function scanAll() {
+    document.querySelectorAll('.left-bubble').forEach(processBubble);
+  }
+
+  /* ── MutationObserver para mensagens novas ───────────────────────── */
+  const observer = new MutationObserver(function (mutations) {
+    let shouldScan = false;
+    for (const m of mutations) {
+      if (m.addedNodes.length > 0) { shouldScan = true; break; }
+    }
+    if (shouldScan) {
+      // Pequeno delay para o DOM renderizar
+      setTimeout(scanAll, 100);
+    }
+  });
+
+  // Observa o painel de conversas (ou o body inteiro se não encontrar)
+  function startObserving() {
+    const panel = document.querySelector('.conversation-panel');
+    const target = panel || document.body;
+    observer.observe(target, { childList: true, subtree: true });
+    scanAll();
+  }
+
+  // Inicia quando o DOM estiver pronto
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startObserving);
+  } else {
+    startObserving();
+  }
+
+  // Resilência: re-escaneia ao trocar de conversa
+  // (o MEGA é SPA, o painel pode ser recriado)
+  let lastUrl = location.href;
+  setInterval(function () {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      setTimeout(scanAll, 500);
+    }
+  }, 1000);
+})();
+</script>

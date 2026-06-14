@@ -1,0 +1,356 @@
+<script>
+/* ==========================================================================
+   MEGA - GOTO CONNECT CLICK-TO-CALL
+   Adiciona um botão de telefone na barra de ações do contato (ao lado do
+   botão "Nova conversa") para iniciar chamadas via GoTo Connect usando o
+   protocolo tel:. O número é obtido automaticamente do perfil do contato
+   via Vuex store, DOM e API (nessa ordem de prioridade).
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: ajuste ALLOWED_ACCOUNTS com os account_ids onde o botão
+   deve aparecer. Ex.: new Set(['1', '3']).
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  /* Contas autorizadas a usar este botão (account_id da URL) */
+  const ALLOWED_ACCOUNTS = new Set(['6']);
+
+  const curAccount = (location.pathname.match(/\/app\/accounts\/(\d+)/) || [])[1];
+  if (!curAccount || !ALLOWED_ACCOUNTS.has(curAccount)) return;
+
+  const STYLE_ID = 'goto-call-style';
+  const BTN_ID   = 'goto-call-btn';
+  if (document.getElementById(STYLE_ID)) return;
+
+  /* ── CSS ──────────────────────────────────────────────────────────── */
+  const css = document.createElement('style');
+  css.id = STYLE_ID;
+  css.textContent = `
+    #${BTN_ID} {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 0;
+      gap: 2px;
+      transition: all .1s ease-out;
+      border: 0;
+      border-radius: 8px;
+      outline: 1px solid transparent;
+      height: 32px;
+      width: 32px;
+      padding: 0;
+      font-size: .875rem;
+      cursor: pointer;
+      text-decoration: none;
+      background: rgba(34,197,94,.12);
+      color: #16a34a;
+    }
+    #${BTN_ID}:hover {
+      background: rgba(34,197,94,.22);
+    }
+    #${BTN_ID}:active {
+      transform: scale(.97);
+    }
+    #${BTN_ID}.is-disabled {
+      opacity: .35;
+      pointer-events: none;
+    }
+    .dark #${BTN_ID} {
+      background: rgba(74,222,128,.12);
+      color: #4ade80;
+    }
+    .dark #${BTN_ID}:hover {
+      background: rgba(74,222,128,.22);
+    }
+  `;
+  document.head.appendChild(css);
+
+  /* ── SVG (ícone de telefone Phosphor-style, 20×20) ───────────────── */
+  const ICON_PHONE =
+    '<svg width="20" height="20" viewBox="0 0 256 256" fill="currentColor">' +
+    '<path d="M222.37,158.46l-47.11-21.11-.13-.06a16,16,0,0,0-15.17,1.4,8.12,' +
+    '8.12,0,0,0-.75.56L134.87,160c-15.42-7.49-31.34-23.29-38.83-38.51l20.78-' +
+    '24.71c.2-.25.39-.5.57-.77a16,16,0,0,0,1.32-15.06l0-.12L97.54,33.64a16,' +
+    '16,0,0,0-16.62-9.52A56.26,56.26,0,0,0,32,80c0,79.4,64.6,144,144,144a56' +
+    '.26,56.26,0,0,0,55.88-48.92A16,16,0,0,0,222.37,158.46ZM176,208A128.14,' +
+    '128.14,0,0,1,48,80,40.2,40.2,0,0,1,82.87,40a.61.61,0,0,0,0,.12l21,47-20' +
+    '.67,24.74a6.13,6.13,0,0,0-.57.77,16,16,0,0,0-1,15.7c9.06,18.53,27.73,37' +
+    '.06,46.46,46.11a16,16,0,0,0,15.75-1.14,8.44,8.44,0,0,0,.74-.56L168.89,' +
+    '152l47,21.05h0s.08,0,.11,0A40.21,40.21,0,0,1,176,208Z"/></svg>';
+
+  /* ── Helpers ─────────────────────────────────────────────────────── */
+  function parseUrl() {
+    const m = location.pathname.match(
+      /\/app\/accounts\/(\d+)\/conversations\/(\d+)/
+    );
+    return m ? { accountId: m[1], convId: m[2] } : null;
+  }
+
+  function getStore() {
+    try {
+      return document.getElementById('app')
+        .__vue_app__.config.globalProperties.$store;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getToken() {
+    if (typeof window.authToken === 'string' && window.authToken) {
+      return window.authToken;
+    }
+    try {
+      const store = getStore();
+      if (!store) return null;
+      const user =
+        store.getters['auth/getCurrentUser'] ||
+        store.getters.getCurrentUser;
+      return (user && user.access_token) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /* ── Estratégia 1: Vuex store (sem rede) ─────────────────────────── */
+  function readFromStore() {
+    try {
+      const store = getStore();
+      if (!store) return '';
+
+      var chat =
+        (store.getters.getSelectedChat) ||
+        (store.getters['getSelectedChat']);
+      if (!chat) return '';
+
+      var contactId =
+        chat.meta && chat.meta.sender && chat.meta.sender.id;
+
+      if (contactId) {
+        try {
+          var contact = store.getters['contacts/getContact'](contactId);
+          if (contact && contact.phone_number) {
+            return String(contact.phone_number);
+          }
+        } catch (_) {}
+      }
+
+      var sender = chat.meta && chat.meta.sender;
+      if (sender && sender.phone_number) {
+        return String(sender.phone_number);
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  /* ── Estratégia 2: Ler do DOM (link tel: na sidebar) ─────────────── */
+  function readFromDom() {
+    try {
+      var telLinks = document.querySelectorAll(
+        '.conversation-sidebar a[href^="tel:"]'
+      );
+      for (var i = 0; i < telLinks.length; i++) {
+        /* Extrair do href para garantir formato limpo */
+        var href = telLinks[i].getAttribute('href') || '';
+        var num = href.replace(/^tel:/, '').trim();
+        if (num) return num;
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  /* ── Estratégia 3: API (fallback com rede) ───────────────────────── */
+  const phoneCache = {};
+
+  async function readFromApi(accountId, convId) {
+    if (convId in phoneCache) return phoneCache[convId];
+
+    const token = getToken();
+    if (!token) return '';
+
+    try {
+      var r1 = await fetch(
+        '/api/v1/accounts/' + accountId + '/conversations/' + convId,
+        { headers: { api_access_token: token } }
+      );
+      if (!r1.ok) return '';
+      var conv = await r1.json();
+      var contactId =
+        conv && conv.meta && conv.meta.sender && conv.meta.sender.id;
+      if (!contactId) return '';
+
+      var r2 = await fetch(
+        '/api/v1/accounts/' + accountId + '/contacts/' + contactId,
+        { headers: { api_access_token: token } }
+      );
+      if (!r2.ok) return '';
+      var contact = await r2.json();
+      var val = (contact && contact.phone_number) || '';
+      phoneCache[convId] = String(val);
+      return phoneCache[convId];
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /* ── Orquestrador: tenta store → DOM → API ───────────────────────── */
+  async function fetchPhone(accountId, convId) {
+    var val = readFromStore();
+    if (val) return val;
+
+    val = readFromDom();
+    if (val) return val;
+
+    val = await readFromApi(accountId, convId);
+    return val;
+  }
+
+  /* Mantém apenas + e dígitos */
+  function sanitizePhone(v) {
+    return v.replace(/[^\d+]/g, '');
+  }
+
+  /* Normaliza celular BR para discagem com 9o dígito quando faltar */
+  function normalizePhoneForDial(v) {
+    var clean = sanitizePhone(v || '');
+    var match = clean.match(/^\+?55(\d{2})(9?)(\d{8})$/);
+    if (!match) return clean;
+
+    var area = match[1];
+    var rest = match[3];
+    if (!/^[6-9]/.test(rest)) return clean;
+
+    return '+55' + area + '9' + rest;
+  }
+
+  /* ── Botão ───────────────────────────────────────────────────────── */
+  let activeConvId = null;
+  let busy = false;
+
+  function removeBtn() {
+    const el = document.getElementById(BTN_ID);
+    if (el) el.remove();
+  }
+
+  function buildBtn(phone) {
+    const a = document.createElement('a');
+    a.id = BTN_ID;
+    a.innerHTML = ICON_PHONE;
+
+    var dialPhone = normalizePhoneForDial(phone);
+    if (dialPhone) {
+      a.href = 'tel:' + dialPhone;
+      a.title = 'Ligar para ' + dialPhone + ' (GoTo Connect)';
+    } else {
+      a.classList.add('is-disabled');
+      a.title = 'Sem telefone disponível';
+    }
+    return a;
+  }
+
+  /* ── Encontrar a barra de ações do contato ───────────────────────── */
+  function findActionBar() {
+    /* Barra de ações: div.flex.items-center contendo o botão "nova conversa"
+       (ícone i-ph-chat-circle-dots). Busca todos e usa o que está na sidebar */
+    var icons = document.querySelectorAll('.i-ph-chat-circle-dots');
+    for (var i = 0; i < icons.length; i++) {
+      var bar = icons[i].closest('.flex.items-center.gap-2');
+      if (bar) return bar;
+    }
+    return null;
+  }
+
+  /* ── Injeção ─────────────────────────────────────────────────────── */
+  async function inject() {
+    const ctx = parseUrl();
+    if (!ctx || !ALLOWED_ACCOUNTS.has(ctx.accountId)) {
+      removeBtn();
+      activeConvId = null;
+      return;
+    }
+
+    /* Botão já presente para esta conversa */
+    if (ctx.convId === activeConvId && document.getElementById(BTN_ID)) {
+      return;
+    }
+
+    /* Barra de ações presente no DOM? */
+    var bar = findActionBar();
+    if (!bar) return;
+
+    /* Nova conversa — limpar */
+    if (ctx.convId !== activeConvId) {
+      removeBtn();
+      activeConvId = ctx.convId;
+    }
+
+    if (document.getElementById(BTN_ID)) return;
+    if (busy) return;
+    busy = true;
+
+    try {
+      const phone = await fetchPhone(ctx.accountId, ctx.convId);
+
+      /* Verificar se ainda estamos na mesma conversa após o fetch */
+      const ctx2 = parseUrl();
+      if (!ctx2 || ctx2.convId !== ctx.convId) return;
+
+      /* Barra pode ter sido re-renderizada pelo Vue */
+      var bar2 = findActionBar();
+      if (!bar2 || document.getElementById(BTN_ID)) return;
+
+      const btn = buildBtn(phone);
+
+      /* Inserir como segundo filho (após o botão "nova conversa") */
+      var firstChild = bar2.firstElementChild;
+      if (firstChild && firstChild.nextElementSibling) {
+        bar2.insertBefore(btn, firstChild.nextElementSibling);
+      } else {
+        bar2.appendChild(btn);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  /* ── Observers & SPA navigation ──────────────────────────────────── */
+  let debounce = null;
+  const observer = new MutationObserver(function () {
+    if (debounce) return;
+    debounce = setTimeout(function () {
+      debounce = null;
+      if (
+        !document.getElementById(BTN_ID) ||
+        (parseUrl() && parseUrl().convId !== activeConvId)
+      ) {
+        inject();
+      }
+    }, 400);
+  });
+
+  function start() {
+    observer.observe(document.body, { childList: true, subtree: true });
+    inject();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+
+  /* Detecta navegação SPA (troca de conversa) */
+  let lastHref = location.href;
+  setInterval(function () {
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      removeBtn();
+      activeConvId = null;
+      var acct = (location.pathname.match(/\/app\/accounts\/(\d+)/) || [])[1];
+      if (acct && ALLOWED_ACCOUNTS.has(acct)) {
+        setTimeout(inject, 600);
+      }
+    }
+  }, 1000);
+})();
+</script>

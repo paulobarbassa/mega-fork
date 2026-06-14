@@ -1,0 +1,629 @@
+<script>
+/* ==========================================================================
+   MEGA - INBOX AVATAR ICONS
+   Substitui o ícone genérico de canal pelo avatar configurado na inbox,
+   tanto na barra lateral quanto na lista de conversas. Os avatares são
+   obtidos via API e mantidos em cache por CACHE_TTL_MS para minimizar
+   requisições redundantes.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: ajuste CACHE_TTL_MS (padrão 60s) e SCAN_DEBOUNCE_MS
+   (padrão 150ms) se necessário.
+   ========================================================================== */
+(function () {
+  "use strict";
+
+  const INSTALL_FLAG = "__chatwootInboxIconsInstalled";
+  if (window[INSTALL_FLAG]) return;
+  window[INSTALL_FLAG] = true;
+
+  const LOG_PREFIX = "[inbox-icons]";
+  const DEBUG = false;
+  const STYLE_ID = "chatwoot-inbox-icons-style";
+  const CACHE_TTL_MS = 60000;
+  const SCAN_DEBOUNCE_MS = 150;
+  const ROUTE_POLL_MS = 1000;
+  const INBOX_WRITE_RE = /\/api\/v1\/accounts\/(\d+)\/inboxes\/(\d+)\/?/i;
+
+  const cacheByAccount = Object.create(null);
+  const inflightByAccount = Object.create(null);
+  let lastHref = location.href;
+  let scanTimer = null;
+
+  function log() {
+    if (!DEBUG || typeof console === "undefined" || !console.log) return;
+    const args = Array.prototype.slice.call(arguments);
+    args.unshift(LOG_PREFIX);
+    console.log.apply(console, args);
+  }
+
+  function installStyles() {
+    if (document.getElementById(STYLE_ID)) return;
+
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      .cwii-inbox-avatar {
+        display: inline-block;
+        width: 1rem;
+        height: 1rem;
+        min-width: 1rem;
+        min-height: 1rem;
+        object-fit: cover;
+        flex: 0 0 auto;
+        vertical-align: middle;
+        background: var(--n-alpha-2, rgba(148, 163, 184, 0.16));
+      }
+
+      .cwii-inbox-avatar-sidebar {
+        width: 100%;
+        height: 100%;
+        min-width: 100%;
+        min-height: 100%;
+        border-radius: 9999px;
+      }
+
+      .cwii-inbox-avatar-list {
+        border-radius: 4px;
+      }
+
+      .cwii-hidden-channel-icon {
+        display: none !important;
+      }
+
+      .cwii-sidebar-icon-host {
+        overflow: hidden;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function parseAccountId() {
+    const match = location.pathname.match(/\/app\/accounts\/(\d+)/);
+    return match ? match[1] : null;
+  }
+
+  function getStore() {
+    try {
+      return document.getElementById("app").__vue_app__.config.globalProperties.$store;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getToken() {
+    if (typeof window.authToken === "string" && window.authToken) {
+      return window.authToken;
+    }
+
+    try {
+      const store = getStore();
+      if (!store) return null;
+      const user = store.getters["auth/getCurrentUser"] || store.getters.getCurrentUser;
+      return (user && user.access_token) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function normalizeName(value) {
+    return String(value || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function safeAbsoluteUrl(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+
+    try {
+      return new URL(raw, location.origin).href;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function firstString() {
+    for (let argumentIndex = 0; argumentIndex < arguments.length; argumentIndex += 1) {
+      const value = arguments[argumentIndex];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+    return "";
+  }
+
+  function pickAvatarUrl(inbox) {
+    if (!inbox || typeof inbox !== "object") return "";
+
+    const channel = inbox.channel && typeof inbox.channel === "object" ? inbox.channel : {};
+    const avatar = inbox.avatar && typeof inbox.avatar === "object" ? inbox.avatar : {};
+    const channelAvatar = channel.avatar && typeof channel.avatar === "object" ? channel.avatar : {};
+
+    return safeAbsoluteUrl(
+      firstString(
+        inbox.avatar_url,
+        inbox.avatarUrl,
+        inbox.avatar_thumb_url,
+        inbox.avatarThumbUrl,
+        inbox.thumbnail,
+        avatar.url,
+        avatar.thumb_url,
+        avatar.thumbUrl,
+        channel.avatar_url,
+        channel.avatarUrl,
+        channelAvatar.url,
+        channelAvatar.thumb_url,
+        channelAvatar.thumbUrl
+      )
+    );
+  }
+
+  function normalizeInbox(inbox) {
+    if (!inbox || typeof inbox !== "object") return null;
+
+    const id = inbox.id != null ? String(inbox.id) : "";
+    const channel = inbox.channel && typeof inbox.channel === "object" ? inbox.channel : {};
+    const name = firstString(inbox.name, channel.name, id ? "Inbox " + id : "");
+    if (!id || !name) return null;
+
+    return {
+      id: id,
+      name: name,
+      nameKey: normalizeName(name),
+      channelType: firstString(inbox.channel_type, inbox.channelType, channel.type),
+      avatarUrl: pickAvatarUrl(inbox),
+    };
+  }
+
+  function asList(value) {
+    if (!value) return [];
+
+    if (Array.isArray(value)) return value;
+
+    if (typeof value === "function") {
+      try {
+        return asList(value());
+      } catch (_) {
+        return [];
+      }
+    }
+
+    if (typeof value === "object") {
+      if (Array.isArray(value.payload)) return value.payload;
+      if (Array.isArray(value.data)) return value.data;
+      if (Array.isArray(value.records)) return value.records;
+      return Object.keys(value).map(function (key) {
+        return value[key];
+      });
+    }
+
+    return [];
+  }
+
+  function addInboxCandidate(target, value) {
+    asList(value).forEach(function (item) {
+      if (item && typeof item === "object") target.push(item);
+    });
+  }
+
+  function readInboxesFromStore() {
+    const store = getStore();
+    if (!store) return [];
+
+    const candidates = [];
+    const getters = (store && store.getters) || {};
+    const state = (store && store.state) || {};
+    const inboxState = state.inboxes || state.inbox || {};
+
+    addInboxCandidate(candidates, getters["inboxes/getInboxes"]);
+    addInboxCandidate(candidates, getters["inboxes/getAllInboxes"]);
+    addInboxCandidate(candidates, getters.getInboxes);
+    addInboxCandidate(candidates, inboxState.records);
+    addInboxCandidate(candidates, inboxState.byId);
+    addInboxCandidate(candidates, inboxState.inboxes);
+    addInboxCandidate(candidates, inboxState.data);
+
+    return candidates;
+  }
+
+  function normalizeResponse(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (!payload || typeof payload !== "object") return [];
+    if (Array.isArray(payload.payload)) return payload.payload;
+    if (Array.isArray(payload.data)) return payload.data;
+    if (payload.payload && Array.isArray(payload.payload.data)) return payload.payload.data;
+    return [];
+  }
+
+  function buildInboxIndex(rawInboxes) {
+    const byId = Object.create(null);
+    const byName = Object.create(null);
+    const duplicateNames = Object.create(null);
+
+    rawInboxes.forEach(function (rawInbox) {
+      const inbox = normalizeInbox(rawInbox);
+      if (!inbox) return;
+
+      const previous = byId[inbox.id];
+      if (!previous) {
+        byId[inbox.id] = inbox;
+      } else {
+        byId[inbox.id] = {
+          id: inbox.id,
+          name: inbox.name || previous.name,
+          nameKey: inbox.nameKey || previous.nameKey,
+          channelType: inbox.channelType || previous.channelType,
+          avatarUrl: inbox.avatarUrl || previous.avatarUrl,
+        };
+      }
+    });
+
+    Object.keys(byId).forEach(function (id) {
+      const inbox = byId[id];
+      if (!inbox.nameKey) return;
+
+      const existing = byName[inbox.nameKey];
+      if (!existing) {
+        byName[inbox.nameKey] = inbox;
+        return;
+      }
+
+      if (existing.id !== inbox.id && existing.avatarUrl !== inbox.avatarUrl) {
+        duplicateNames[inbox.nameKey] = true;
+      }
+    });
+
+    Object.keys(duplicateNames).forEach(function (nameKey) {
+      delete byName[nameKey];
+    });
+
+    return { byId: byId, byName: byName };
+  }
+
+  async function fetchInboxesFromApi(accountId) {
+    const token = getToken();
+    if (!token) return [];
+
+    try {
+      const response = await fetch("/api/v1/accounts/" + accountId + "/inboxes", {
+        headers: { api_access_token: token },
+      });
+
+      if (!response.ok) {
+        log("falha ao buscar inboxes", response.status);
+        return [];
+      }
+
+      return normalizeResponse(await response.json());
+    } catch (error) {
+      log("erro ao buscar inboxes", error && error.message ? error.message : error);
+      return [];
+    }
+  }
+
+  function mergeInboxLists(storeInboxes, apiInboxes) {
+    const mergedById = Object.create(null);
+
+    storeInboxes.concat(apiInboxes).forEach(function (inbox) {
+      const normalized = normalizeInbox(inbox);
+      if (!normalized) return;
+
+      const previous = mergedById[normalized.id];
+      mergedById[normalized.id] = previous
+        ? {
+            id: normalized.id,
+            name: normalized.name || previous.name,
+            channel_type: normalized.channelType || previous.channel_type,
+            avatar_url: normalized.avatarUrl || previous.avatar_url,
+          }
+        : {
+            id: normalized.id,
+            name: normalized.name,
+            channel_type: normalized.channelType,
+            avatar_url: normalized.avatarUrl,
+          };
+    });
+
+    return Object.keys(mergedById).map(function (id) {
+      return mergedById[id];
+    });
+  }
+
+  async function getInboxIndex(accountId, force) {
+    const cached = cacheByAccount[accountId];
+    if (!force && cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+      return cached.index;
+    }
+
+    if (!force && inflightByAccount[accountId]) {
+      return inflightByAccount[accountId];
+    }
+
+    inflightByAccount[accountId] = (async function () {
+      const storeInboxes = readInboxesFromStore();
+      const apiInboxes = await fetchInboxesFromApi(accountId);
+      const allInboxes = mergeInboxLists(storeInboxes, apiInboxes);
+      const index = buildInboxIndex(allInboxes);
+
+      cacheByAccount[accountId] = { ts: Date.now(), index: index };
+      delete inflightByAccount[accountId];
+      return index;
+    })();
+
+    return inflightByAccount[accountId];
+  }
+
+  function parseSidebarInboxId(anchor) {
+    try {
+      const url = new URL(anchor.getAttribute("href") || "", location.origin);
+      const match = url.pathname.match(/\/app\/accounts\/(\d+)\/inbox\/(\d+)/);
+      return match ? match[2] : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function findChannelIcon(root) {
+    if (!root || !root.querySelector) return null;
+    return root.querySelector("span[class*='i-woot-']");
+  }
+
+  function findExistingAvatar(host) {
+    if (!host || !host.querySelector) return null;
+    return host.querySelector("img.cwii-inbox-avatar");
+  }
+
+  function removeExistingAvatars(host) {
+    if (!host || !host.querySelectorAll) return;
+
+    host.querySelectorAll("img.cwii-inbox-avatar").forEach(function (avatar) {
+      avatar.remove();
+    });
+  }
+
+  function hideOriginalIcon(icon) {
+    if (!icon) return;
+    icon.classList.add("cwii-hidden-channel-icon");
+    icon.setAttribute("data-cwii-hidden", "1");
+  }
+
+  function restoreOriginalIcon(icon, variant) {
+    if (!icon) return;
+
+    const host = icon.parentElement;
+    removeExistingAvatars(host);
+    icon.classList.remove("cwii-hidden-channel-icon");
+    icon.removeAttribute("data-cwii-hidden");
+
+    if (variant === "sidebar" && host) {
+      host.classList.remove("cwii-sidebar-icon-host");
+    }
+  }
+
+  function applyAvatar(icon, inbox, variant) {
+    if (!icon || !inbox || !inbox.avatarUrl) return false;
+
+    const host = icon.parentElement;
+    if (!host) return false;
+
+    const className = variant === "sidebar"
+      ? "cwii-inbox-avatar cwii-inbox-avatar-sidebar"
+      : "cwii-inbox-avatar cwii-inbox-avatar-list";
+
+    let img = findExistingAvatar(host);
+    if (!img) {
+      img = document.createElement("img");
+      img.loading = "lazy";
+      img.decoding = "async";
+      host.insertBefore(img, icon);
+    }
+
+    if (img.getAttribute("data-cwii-avatar-url") !== inbox.avatarUrl) {
+      img.src = inbox.avatarUrl;
+      img.setAttribute("data-cwii-avatar-url", inbox.avatarUrl);
+    }
+
+    img.className = className;
+    img.alt = inbox.name || "Inbox";
+    img.title = inbox.name || "";
+
+    if (variant === "sidebar") {
+      host.classList.add("cwii-sidebar-icon-host");
+    }
+
+    hideOriginalIcon(icon);
+    return true;
+  }
+
+  function applySidebarIcons(accountId, index) {
+    const anchors = document.querySelectorAll("a[href*='/app/accounts/" + accountId + "/inbox/']");
+
+    anchors.forEach(function (anchor) {
+      const inboxId = parseSidebarInboxId(anchor);
+      const inbox = inboxId && index.byId[inboxId];
+      const icon = findChannelIcon(anchor);
+
+      if (!inbox || !inbox.avatarUrl) {
+        restoreOriginalIcon(icon, "sidebar");
+        return;
+      }
+
+      applyAvatar(icon, inbox, "sidebar");
+    });
+  }
+
+  function closestChannelLabel(icon) {
+    let node = icon && icon.parentElement;
+
+    while (node && node !== document.body) {
+      if (node.getAttribute && node.getAttribute("title")) return node;
+      if (node.classList && node.classList.contains("conversation")) return null;
+      node = node.parentElement;
+    }
+
+    return null;
+  }
+
+  function getLabelName(label) {
+    if (!label) return "";
+
+    const title = label.getAttribute("title");
+    if (title && title.trim()) return title.trim();
+
+    const textNodes = label.querySelectorAll("span:not([class*='i-woot-']):not(.cwii-hidden-channel-icon)");
+    for (let textNodeIndex = 0; textNodeIndex < textNodes.length; textNodeIndex += 1) {
+      const text = textNodes[textNodeIndex].textContent.trim();
+      if (text) return text;
+    }
+
+    return label.textContent.trim();
+  }
+
+  function applyConversationListIcons(index) {
+    const icons = document.querySelectorAll(
+      ".conversation div[title] span[class*='i-woot-']"
+    );
+
+    icons.forEach(function (icon) {
+      const label = closestChannelLabel(icon);
+      const nameKey = normalizeName(getLabelName(label));
+      const inbox = nameKey && index.byName[nameKey];
+
+      if (!inbox || !inbox.avatarUrl) {
+        restoreOriginalIcon(icon, "list");
+        return;
+      }
+
+      applyAvatar(icon, inbox, "list");
+    });
+  }
+
+  async function scan(force) {
+    const accountId = parseAccountId();
+    if (!accountId) return;
+
+    const index = await getInboxIndex(accountId, force);
+    applySidebarIcons(accountId, index);
+    applyConversationListIcons(index);
+  }
+
+  function scheduleScan(force) {
+    if (scanTimer) window.clearTimeout(scanTimer);
+
+    scanTimer = window.setTimeout(function () {
+      scanTimer = null;
+      scan(Boolean(force));
+    }, SCAN_DEBOUNCE_MS);
+  }
+
+  function clearAccountCache(accountId) {
+    if (!accountId) return;
+    delete cacheByAccount[accountId];
+    delete inflightByAccount[accountId];
+  }
+
+  function isSuccessStatus(status) {
+    return Number(status) >= 200 && Number(status) < 300;
+  }
+
+  function toAbsoluteUrl(input) {
+    try {
+      if (!input) return null;
+      if (typeof input === "string") return new URL(input, location.origin);
+      if (typeof Request !== "undefined" && input instanceof Request) return new URL(input.url, location.origin);
+      if (typeof input.url === "string") return new URL(input.url, location.origin);
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  function parseInboxWrite(input, method) {
+    const requestMethod = String(method || "GET").trim().toUpperCase();
+    if (requestMethod !== "PUT" && requestMethod !== "PATCH" && requestMethod !== "POST") return null;
+
+    const url = toAbsoluteUrl(input);
+    if (!url) return null;
+
+    const match = url.pathname.match(INBOX_WRITE_RE);
+    return match ? { accountId: match[1], inboxId: match[2] } : null;
+  }
+
+  function handleInboxWriteSuccess(info) {
+    if (!info) return;
+    clearAccountCache(info.accountId);
+    scheduleScan(true);
+  }
+
+  function installFetchInterceptor() {
+    if (typeof window.fetch !== "function") return;
+
+    const originalFetch = window.fetch;
+    window.fetch = function (input, init) {
+      const method = (init && init.method) || (input && input.method);
+      const info = parseInboxWrite(input, method);
+
+      return originalFetch.apply(this, arguments).then(function (response) {
+        if (info && response && isSuccessStatus(response.status)) {
+          handleInboxWriteSuccess(info);
+        }
+        return response;
+      });
+    };
+  }
+
+  function installXhrInterceptor() {
+    if (typeof XMLHttpRequest === "undefined") return;
+
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this._cwiiInboxWrite = parseInboxWrite(url, method);
+      return originalOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      this.addEventListener("load", function () {
+        if (this._cwiiInboxWrite && isSuccessStatus(this.status)) {
+          handleInboxWriteSuccess(this._cwiiInboxWrite);
+        }
+      });
+      return originalSend.apply(this, arguments);
+    };
+  }
+
+  function watchDom() {
+    const observer = new MutationObserver(function () {
+      scheduleScan(false);
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function watchRoute() {
+    window.setInterval(function () {
+      if (location.href === lastHref) return;
+      lastHref = location.href;
+      scheduleScan(false);
+    }, ROUTE_POLL_MS);
+  }
+
+  function start() {
+    installStyles();
+    installFetchInterceptor();
+    installXhrInterceptor();
+    watchDom();
+    watchRoute();
+    scheduleScan(false);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>

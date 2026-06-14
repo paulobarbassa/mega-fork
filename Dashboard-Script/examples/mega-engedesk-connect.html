@@ -1,0 +1,170 @@
+<script>
+/* ==========================================================================
+   MEGA - ENGEDESK CONNECT BUTTON
+   Detecta links engedeskconsoletech:// em notas privadas e mensagens,
+   substituindo-os por botões estilizados que iniciam uma sessão de acesso
+   remoto via EngeDesk. Monitora o DOM continuamente para capturar mensagens
+   carregadas após a abertura da conversa.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Requer: EngeDesk (RustDesk) instalado com o handler engedeskconsoletech://.
+   ========================================================================== */
+(function () {
+  const STYLE_ID  = 'engedesk-connect-style';
+  const ATTR_DONE = 'data-engedesk-processed';
+  if (document.getElementById(STYLE_ID)) return;
+
+  /* ── CSS do botão ────────────────────────────────────────────────── */
+  const style = document.createElement('style');
+  style.id = STYLE_ID;
+  style.textContent = `
+    .engedesk-connect-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #0d7377, #14919b);
+      color: #fff;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background 0.2s, box-shadow 0.2s, transform 0.1s;
+      box-shadow: 0 2px 6px rgba(13, 115, 119, 0.3);
+      line-height: 1.4;
+    }
+    .engedesk-connect-btn:hover {
+      background: linear-gradient(135deg, #0a5c5f, #0d7377);
+      box-shadow: 0 4px 12px rgba(13, 115, 119, 0.45);
+      transform: translateY(-1px);
+    }
+    .engedesk-connect-btn:active {
+      transform: translateY(0);
+      box-shadow: 0 1px 4px rgba(13, 115, 119, 0.3);
+    }
+    .engedesk-connect-btn svg {
+      flex-shrink: 0;
+    }
+
+    /* Dark mode */
+    .dark .engedesk-connect-btn {
+      background: linear-gradient(135deg, #00bfa5, #26d9c4);
+      color: #0a0a0a;
+      box-shadow: 0 2px 8px rgba(0, 191, 165, 0.35);
+    }
+    .dark .engedesk-connect-btn:hover {
+      background: linear-gradient(135deg, #1de9b6, #64ffda);
+      color: #0a0a0a;
+      box-shadow: 0 4px 14px rgba(0, 191, 165, 0.5);
+    }
+  `;
+  document.head.appendChild(style);
+
+  /* ── Ícone SVG do monitor/conexão ────────────────────────────────── */
+  const ICON_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>' +
+    '<line x1="8" y1="21" x2="16" y2="21"/>' +
+    '<line x1="12" y1="17" x2="12" y2="21"/>' +
+    '</svg>';
+
+  /* ── Regex para capturar engedeskconsoletech://ID ────────────────── */
+  const ENGEDESK_RE = /engedeskconsoletech:\/\/[\d\s]+/gi;
+
+  /* ── Processa um elemento de nota/mensagem ───────────────────────── */
+  function processElement(el) {
+    if (el.hasAttribute(ATTR_DONE)) return;
+
+    const prose = el.querySelector('.prose');
+    if (!prose) return;
+
+    const textContent = prose.textContent || '';
+    const matches = textContent.match(ENGEDESK_RE);
+    if (!matches) return;
+
+    el.setAttribute(ATTR_DONE, '1');
+
+    matches.forEach(function (rawMatch) {
+      // Extrai o ID (remove espaços para o link real)
+      const rawId = rawMatch.replace('engedeskconsoletech://', '').trim();
+      const cleanId = rawId.replace(/\s+/g, '');
+      const connectUrl = 'engedeskconsoletech://' + cleanId;
+      const displayId = rawId;
+
+      // Encontra o nó de texto que contém o link e substitui
+      const walker = document.createTreeWalker(prose, NodeFilter.SHOW_TEXT, null, false);
+      let node;
+      while ((node = walker.nextNode())) {
+        const idx = node.textContent.indexOf(rawMatch.trimEnd());
+        if (idx === -1) continue;
+
+        // Cria o botão
+        const btn = document.createElement('a');
+        btn.href = connectUrl;
+        btn.className = 'engedesk-connect-btn';
+        btn.title = 'Conectar ao EngeDesk: ' + cleanId;
+        btn.innerHTML = ICON_SVG + ' Conectar — ' + displayId;
+
+        // Substitui o texto do link pelo botão
+        const before = node.textContent.substring(0, idx);
+        const after  = node.textContent.substring(idx + rawMatch.trimEnd().length);
+
+        const beforeNode = document.createTextNode(before);
+        const afterNode  = document.createTextNode(after);
+
+        const parent = node.parentNode;
+        parent.insertBefore(beforeNode, node);
+        parent.insertBefore(btn, node);
+        parent.insertBefore(afterNode, node);
+        parent.removeChild(node);
+        break;
+      }
+    });
+  }
+
+  /* ── Escaneia notas/atividades visíveis ──────────────────────────── */
+  function scanAll() {
+    // Notas privadas (activity) e balões de mensagem
+    document.querySelectorAll(
+      '.conversation-panel .activity-wrap:not([' + ATTR_DONE + ']), ' +
+      '.conversation-panel .right-bubble:not([' + ATTR_DONE + ']), ' +
+      '.conversation-panel .left-bubble:not([' + ATTR_DONE + '])'
+    ).forEach(processElement);
+  }
+
+  /* ── MutationObserver para mensagens novas ───────────────────────── */
+  const observer = new MutationObserver(function (mutations) {
+    let shouldScan = false;
+    for (const m of mutations) {
+      if (m.addedNodes.length > 0) { shouldScan = true; break; }
+    }
+    if (shouldScan) {
+      setTimeout(scanAll, 150);
+    }
+  });
+
+  function startObserving() {
+    const panel = document.querySelector('.conversation-panel');
+    const target = panel || document.body;
+    observer.observe(target, { childList: true, subtree: true });
+    scanAll();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startObserving);
+  } else {
+    startObserving();
+  }
+
+  // Re-escaneia ao trocar de conversa (MEGA é SPA)
+  let lastUrl = location.href;
+  setInterval(function () {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      setTimeout(scanAll, 500);
+    }
+  }, 1000);
+})();
+</script>

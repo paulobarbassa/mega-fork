@@ -1,0 +1,136 @@
+<script>
+/* ==========================================================================
+   MEGA - THROTTLE / DEDUP DE CONTADORES
+   Reduz requisições repetidas ao servidor coalescendo chamadas duplicadas
+   e aplicando cache TTL nos endpoints "barulhentos" do SPA:
+     - /api/v1/accounts/{id}/conversations/meta
+     - /api/v1/accounts/{id}/notifications/unread_count
+   Esses endpoints são disparados em rajada (badges de abas, sino de
+   notificação) e chegam a aparecer múltiplas vezes em <1s no log do Rails.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: ajuste os valores em ENDPOINT_TTL_MS (padrão: 5000ms)
+   para controlar por quanto tempo cada resposta fica em cache.
+   ========================================================================== */
+(function () {
+  "use strict";
+
+  if (window.__chatwootCounterThrottleInstalled) return;
+  window.__chatwootCounterThrottleInstalled = true;
+
+  const LOG_PREFIX = "[throttle-counters]";
+  const DEBUG = false;
+
+  // TTL por endpoint (ms). Respostas servidas do cache durante esse intervalo.
+  // Mantem badges atualizados em ate ~5s, suficiente para o caso de uso.
+  const ENDPOINT_TTL_MS = {
+    "conversations/meta": 5000,
+    "notifications/unread_count": 5000,
+  };
+
+  // Cache de respostas: chave = metodo + url + body, valor = { ts, response }
+  const responseCache = new Map();
+  // Promises em voo para o mesmo recurso (deduplicacao).
+  const inflight = new Map();
+
+  function log() {
+    if (!DEBUG || typeof console === "undefined" || !console.log) return;
+    const args = Array.prototype.slice.call(arguments);
+    args.unshift(LOG_PREFIX);
+    console.log.apply(console, args);
+  }
+
+  function matchEndpoint(url) {
+    for (const key in ENDPOINT_TTL_MS) {
+      if (url.indexOf(key) !== -1) return key;
+    }
+    return null;
+  }
+
+  function buildKey(method, url, bodyText) {
+    return method + " " + url + (bodyText ? " " + bodyText : "");
+  }
+
+  function cloneCachedResponse(response) {
+    return response.clone();
+  }
+
+  const originalFetch = window.fetch.bind(window);
+
+  window.fetch = function (input, init) {
+    let url;
+    let method = "GET";
+    let bodyText = "";
+
+    try {
+      if (typeof input === "string") {
+        url = input;
+      } else if (input instanceof Request) {
+        url = input.url;
+        method = (input.method || "GET").toUpperCase();
+      } else if (input && typeof input.url === "string") {
+        url = input.url;
+      } else {
+        return originalFetch(input, init);
+      }
+
+      if (init && init.method) method = String(init.method).toUpperCase();
+      // Apenas GETs sao seguros para cache/dedup.
+      if (method !== "GET") return originalFetch(input, init);
+
+      const endpoint = matchEndpoint(url);
+      if (!endpoint) return originalFetch(input, init);
+
+      const ttl = ENDPOINT_TTL_MS[endpoint];
+      const key = buildKey(method, url, bodyText);
+      const now = Date.now();
+
+      const cached = responseCache.get(key);
+      if (cached && now - cached.ts < ttl) {
+        log("cache hit", endpoint, url);
+        return Promise.resolve(cloneCachedResponse(cached.response));
+      }
+
+      const pending = inflight.get(key);
+      if (pending) {
+        log("dedup", endpoint, url);
+        return pending.then(cloneCachedResponse);
+      }
+
+      const promise = originalFetch(input, init).then(function (response) {
+        // Cacheia apenas respostas OK; clonamos antes de armazenar.
+        if (response && response.ok) {
+          try {
+            responseCache.set(key, { ts: Date.now(), response: response.clone() });
+          } catch (_) {
+            // se clone falhar, segue sem cache
+          }
+        }
+        return response;
+      }).finally(function () {
+        inflight.delete(key);
+      });
+
+      inflight.set(key, promise);
+      return promise.then(cloneCachedResponse);
+    } catch (error) {
+      log("erro no interceptor, repassando", error);
+      return originalFetch(input, init);
+    }
+  };
+
+  // Limpeza periodica do cache para evitar crescimento indefinido.
+  window.setInterval(function () {
+    const now = Date.now();
+    responseCache.forEach(function (entry, key) {
+      const endpoint = matchEndpoint(key) || "";
+      const ttl = ENDPOINT_TTL_MS[endpoint] || 5000;
+      if (now - entry.ts > ttl * 4) {
+        responseCache.delete(key);
+      }
+    });
+  }, 60000);
+
+  log("instalado");
+})();
+</script>

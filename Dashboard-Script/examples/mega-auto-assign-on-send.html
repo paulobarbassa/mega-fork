@@ -1,0 +1,446 @@
+<script>
+/* ==========================================================================
+   MEGA - AUTO-ASSIGN ON SEND
+   Atribui automaticamente a conversa ao agente que está enviando a mensagem,
+   caso a conversa ainda não tenha responsável (assigned_agent_id nulo).
+   Intercepta o endpoint de criação de mensagens via XHR/fetch e dispara a
+   atribuição via API imediatamente após o envio bem-sucedido.
+
+   Instalação: Super Admin → Dashboard Apps → adicione como Custom Script.
+   Configuração: adicione account_ids em DENYLIST_ACCOUNTS para excluir
+   contas específicas do comportamento automático.
+   ========================================================================== */
+  (function () {
+  "use strict";
+
+  const INSTALL_FLAG = "__chatwootAutoAssignOnSendInstalled";
+  if (window[INSTALL_FLAG]) return;
+  window[INSTALL_FLAG] = true;
+
+  const LOG_PREFIX = "[auto-assign-on-send]";
+  const DEBUG = false;
+  const DENYLIST_ACCOUNTS = new Set([]);
+  const MESSAGE_STATE_CACHE_TTL_MS = 3000;
+  const ASSIGN_DEDUP_TTL_MS = 4000;
+  const CLEANUP_TTL_MS = 60000;
+  const ROUTE_POLL_MS = 1000;
+  const MESSAGE_PATH_RE = /^\/api\/v1\/accounts\/(\d+)\/conversations\/(\d+)\/messages\/?$/i;
+
+  const stateCache = Object.create(null);
+  const recentAttempts = Object.create(null);
+  const inflightAssignments = Object.create(null);
+  let lastHref = location.href;
+
+  function log() {
+    if (!DEBUG || typeof console === "undefined" || !console.log) return;
+    const args = Array.prototype.slice.call(arguments);
+    args.unshift(LOG_PREFIX);
+    console.log.apply(console, args);
+  }
+
+  function parseRouteUrl() {
+    const match = location.pathname.match(/\/app\/accounts\/(\d+)\/conversations\/(\d+)/);
+    return match ? { accountId: match[1], conversationId: match[2] } : null;
+  }
+
+  function isAllowedAccount(accountId) {
+    return Boolean(accountId) && !DENYLIST_ACCOUNTS.has(String(accountId));
+  }
+
+  function getStore() {
+    try {
+      return document.getElementById("app").__vue_app__.config.globalProperties.$store;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getCurrentUser() {
+    try {
+      const store = getStore();
+      if (!store) return null;
+      return store.getters["auth/getCurrentUser"] || store.getters.getCurrentUser || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getToken() {
+    if (typeof window.authToken === "string" && window.authToken) {
+      return window.authToken;
+    }
+
+    const user = getCurrentUser();
+    return (user && user.access_token) || null;
+  }
+
+  function getSelectedChat() {
+    try {
+      const store = getStore();
+      if (!store) return null;
+      return store.getters.getSelectedChat || store.getters["getSelectedChat"] || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function extractEntityId(entity) {
+    if (entity == null || entity === "") return null;
+    if (typeof entity === "object") {
+      if (entity.id != null && entity.id !== "") return entity.id;
+      if (entity.user_id != null && entity.user_id !== "") return entity.user_id;
+      return null;
+    }
+    return entity;
+  }
+
+  function normalizeBoolean(value) {
+    if (value === true || value === false) return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      return normalized === "true" || normalized === "1" || normalized === "yes";
+    }
+    return false;
+  }
+
+  function toAbsoluteUrl(input) {
+    try {
+      if (!input) return null;
+      if (typeof input === "string") {
+        return new URL(input, location.origin);
+      }
+      if (typeof Request !== "undefined" && input instanceof Request) {
+        return new URL(input.url, location.origin);
+      }
+      if (typeof input.url === "string") {
+        return new URL(input.url, location.origin);
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  function parseMessageRequest(input, method) {
+    const url = toAbsoluteUrl(input);
+    if (!url) return null;
+
+    const requestMethod = String(method || "GET").trim().toUpperCase();
+    if (requestMethod !== "POST") return null;
+
+    const match = url.pathname.match(MESSAGE_PATH_RE);
+    if (!match) return null;
+
+    return {
+      accountId: match[1],
+      conversationId: match[2],
+      pathname: url.pathname,
+    };
+  }
+
+  function parseBody(body) {
+    if (!body) return {};
+
+    if (typeof body === "string") {
+      try {
+        return JSON.parse(body);
+      } catch (_) {
+        try {
+          const params = new URLSearchParams(body);
+          return Object.fromEntries(params.entries());
+        } catch (_) {
+          return {};
+        }
+      }
+    }
+
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+      const data = {};
+      body.forEach(function (value, key) {
+        data[key] = value;
+      });
+      return data;
+    }
+
+    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+      return Object.fromEntries(body.entries());
+    }
+
+    if (typeof body === "object") {
+      return body;
+    }
+
+    return {};
+  }
+
+  function isPublicAgentMessage(bodyData) {
+    const payload = bodyData || {};
+    if (normalizeBoolean(payload.private)) {
+      return false;
+    }
+
+    const messageType = String(
+      payload.message_type != null ? payload.message_type : payload.messageType != null ? payload.messageType : "outgoing"
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!messageType) return true;
+    if (messageType === "template" || messageType === "activity") return false;
+    return messageType === "outgoing" || messageType === "1";
+  }
+
+  function getConversationStateFromStore(conversationId) {
+    const chat = getSelectedChat();
+    if (!chat || String(chat.id) !== String(conversationId)) {
+      return null;
+    }
+
+    const meta = chat.meta || {};
+    return {
+      assigneeId: extractEntityId(chat.assignee) || extractEntityId(meta.assignee),
+      teamId: extractEntityId(chat.team) || extractEntityId(meta.team),
+      source: "store",
+    };
+  }
+
+  async function fetchConversationState(accountId, conversationId) {
+    const cacheKey = accountId + ":" + conversationId;
+    const cached = stateCache[cacheKey];
+    if (cached && Date.now() - cached.ts < MESSAGE_STATE_CACHE_TTL_MS) {
+      return cached.data;
+    }
+
+    const token = getToken();
+    if (!token) return null;
+
+    try {
+      const response = await fetch(
+        "/api/v1/accounts/" + accountId + "/conversations/" + conversationId,
+        { headers: { api_access_token: token } }
+      );
+
+      if (!response.ok) {
+        log("falha ao consultar conversa", response.status, cacheKey);
+        return null;
+      }
+
+      const payload = await response.json();
+      const meta = (payload && payload.meta) || {};
+      const data = {
+        assigneeId: extractEntityId(payload.assignee) || extractEntityId(meta.assignee),
+        teamId: extractEntityId(payload.team) || extractEntityId(meta.team),
+        source: "api",
+      };
+
+      stateCache[cacheKey] = { ts: Date.now(), data: data };
+      return data;
+    } catch (error) {
+      log("erro ao consultar conversa", cacheKey, error && error.message ? error.message : error);
+      return null;
+    }
+  }
+
+  async function getConversationState(accountId, conversationId) {
+    const storeState = getConversationStateFromStore(conversationId);
+    if (storeState && (storeState.assigneeId || storeState.teamId)) {
+      return storeState;
+    }
+
+    const apiState = await fetchConversationState(accountId, conversationId);
+    return apiState || storeState;
+  }
+
+  async function assignConversation(accountId, conversationId, agentId) {
+    const token = getToken();
+    if (!token) {
+      throw new Error("Nao foi possivel obter o token do dashboard.");
+    }
+
+    const response = await fetch(
+      "/api/v1/accounts/" + accountId + "/conversations/" + conversationId + "/assignments",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          api_access_token: token,
+        },
+        body: JSON.stringify({ assignee_id: agentId }),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error("Falha ao atribuir conversa. HTTP " + response.status);
+    }
+
+    stateCache[accountId + ":" + conversationId] = {
+      ts: Date.now(),
+      data: { assigneeId: agentId, teamId: null, source: "assign" },
+    };
+
+    try {
+      return await response.json();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function shouldSkipRecentAttempt(key) {
+    const ts = recentAttempts[key];
+    return Boolean(ts) && Date.now() - ts < ASSIGN_DEDUP_TTL_MS;
+  }
+
+  function markAttempt(key) {
+    recentAttempts[key] = Date.now();
+  }
+
+  function cleanupState() {
+    const now = Date.now();
+
+    Object.keys(recentAttempts).forEach(function (key) {
+      if (now - recentAttempts[key] > CLEANUP_TTL_MS) {
+        delete recentAttempts[key];
+      }
+    });
+
+    Object.keys(stateCache).forEach(function (key) {
+      if (now - stateCache[key].ts > CLEANUP_TTL_MS) {
+        delete stateCache[key];
+      }
+    });
+  }
+
+  function getAgentId() {
+    return extractEntityId(getCurrentUser());
+  }
+
+  async function maybeAutoAssign(context) {
+    if (!context || !isAllowedAccount(context.accountId)) return;
+    if (!isPublicAgentMessage(context.bodyData)) return;
+
+    const agentId = getAgentId();
+    if (!agentId) {
+      log("usuario atual nao encontrado; auto-assign ignorado");
+      return;
+    }
+
+    const key = context.accountId + ":" + context.conversationId;
+    if (inflightAssignments[key]) {
+      log("atribuicao em andamento", key);
+      return;
+    }
+    if (shouldSkipRecentAttempt(key)) {
+      log("atribuicao ignorada por deduplicacao", key);
+      return;
+    }
+
+    inflightAssignments[key] = true;
+    markAttempt(key);
+
+    try {
+      const state = await getConversationState(context.accountId, context.conversationId);
+      if (!state) {
+        log("estado da conversa indisponivel", key);
+        return;
+      }
+
+      if (state.assigneeId) {
+        log("conversa ja atribuida", key, state);
+        return;
+      }
+
+      await assignConversation(context.accountId, context.conversationId, agentId);
+      log("conversa atribuida automaticamente", key, agentId);
+    } catch (error) {
+      log("erro na auto-atribuicao", key, error && error.message ? error.message : error);
+    } finally {
+      delete inflightAssignments[key];
+    }
+  }
+
+  function scheduleAutoAssign(context) {
+    window.setTimeout(function () {
+      maybeAutoAssign(context);
+    }, 0);
+  }
+
+  function isSuccessStatus(status) {
+    return Number(status) >= 200 && Number(status) < 300;
+  }
+
+  function installFetchInterceptor() {
+    if (typeof window.fetch !== "function") return;
+
+    const originalFetch = window.fetch;
+    window.fetch = function (input, init) {
+      const method = (init && init.method) || (input && input.method);
+      const requestInfo = parseMessageRequest(input, method);
+      const bodyData = parseBody(init && init.body);
+
+      return originalFetch.apply(this, arguments).then(function (response) {
+        if (requestInfo && response && isSuccessStatus(response.status)) {
+          scheduleAutoAssign({
+            accountId: requestInfo.accountId,
+            conversationId: requestInfo.conversationId,
+            bodyData: bodyData,
+          });
+        }
+        return response;
+      });
+    };
+  }
+
+  function installXhrInterceptor() {
+    if (typeof XMLHttpRequest === "undefined") return;
+
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this._autoAssignRequestInfo = parseMessageRequest(url, method);
+      return originalOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function (body) {
+      const bodyData = parseBody(body);
+      this.addEventListener("load", function () {
+        if (this._autoAssignRequestInfo && isSuccessStatus(this.status)) {
+          scheduleAutoAssign({
+            accountId: this._autoAssignRequestInfo.accountId,
+            conversationId: this._autoAssignRequestInfo.conversationId,
+            bodyData: bodyData,
+          });
+        }
+      });
+      return originalSend.apply(this, arguments);
+    };
+  }
+
+  function watchNavigation() {
+    window.setInterval(function () {
+      if (location.href === lastHref) return;
+      lastHref = location.href;
+      cleanupState();
+
+      const route = parseRouteUrl();
+      if (route) {
+        log("navegacao detectada", route.accountId + ":" + route.conversationId);
+      } else {
+        log("navegacao detectada fora de conversa", lastHref);
+      }
+    }, ROUTE_POLL_MS);
+
+    window.setInterval(cleanupState, CLEANUP_TTL_MS);
+  }
+
+  function start() {
+    log("script carregado", { href: location.href, denylistSize: DENYLIST_ACCOUNTS.size });
+    installFetchInterceptor();
+    installXhrInterceptor();
+    watchNavigation();
+  }
+
+  start();
+})();
+</script>
